@@ -68,7 +68,11 @@ export const dataLayers = pgTable('data_layers', {
   lastSyncedAt: timestamp('last_synced_at'),
   recordCount:  integer('record_count'),
   metadata:     jsonb('metadata'),
-})
+},
+(t) => [
+  uniqueIndex('uq_data_layers_county_url').on(t.countyId, t.serviceUrl),
+]
+)
 
 // ---------------------------------------------------------------------------
 // PARCELS
@@ -103,7 +107,7 @@ export const parcelsDupage = pgTable(
     ownershipType:    varchar('ownership_type', { length: 20 }),
     // FEMA designation: 'AE' | 'X' | 'A' | 'AH' | 'AO' — populated by
     // spatial join with flood_zones overlay at ingest time
-    floodZone:        varchar('flood_zone', { length: 30 }),
+    floodZone:        varchar('flood_zone', { length: 100 }),
     schoolDistrict:   varchar('school_district', { length: 100 }),
     geometry:         geometry('geometry'),
 
@@ -147,7 +151,7 @@ export const parcelsCook = pgTable(
     buildingSqft:     numeric('building_sqft'),
     yearBuilt:        integer('year_built'),
     ownershipType:    varchar('ownership_type', { length: 20 }),
-    floodZone:        varchar('flood_zone', { length: 30 }),
+    floodZone:        varchar('flood_zone', { length: 100 }),
     schoolDistrict:   varchar('school_district', { length: 100 }),
     geometry:         geometry('geometry'),
     rawAttributes:    jsonb('raw_attributes'),
@@ -192,6 +196,7 @@ export const spatialFeatures = pgTable(
   },
   (t) => [
     index('idx_spatial_county_type').on(t.countyId, t.layerType),
+    uniqueIndex('uq_spatial_layer_feature').on(t.layerId, t.featureId),
   ]
 )
 

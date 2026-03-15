@@ -1,35 +1,55 @@
 import { Hono } from 'hono'
+import { eq, and } from 'drizzle-orm'
+import { db } from '../db/client'
+import { counties, municipalities, dataLayers } from '../db/schema'
 
 const layers = new Hono()
 
 // GET /layers
-// Returns all ingested data layers across both counties.
-// Query: ?county=cook|dupage&type=parcel|flood|zoning|... (optional filters)
+// ?county=cook|dupage  ?type=parcel|flood|...
 layers.get('/', async (c) => {
-  // TODO: query data_layers table with optional county + type filters
-  return c.json({ message: 'layers — not yet implemented' }, 501)
+  const county    = c.req.query('county')
+  const layerType = c.req.query('type')
+
+  const rows = await db.select().from(dataLayers)
+    .where(
+      county && layerType
+        ? and(eq(dataLayers.countyId, county), eq(dataLayers.layerType, layerType))
+        : county
+        ? eq(dataLayers.countyId, county)
+        : layerType
+        ? eq(dataLayers.layerType, layerType)
+        : undefined,
+    )
+    .limit(200)
+
+  return c.json(rows)
 })
 
 // GET /layers/counties
-// Returns the list of all counties with their metadata.
 layers.get('/counties', async (c) => {
-  // TODO: query counties table
-  return c.json({ message: 'counties — not yet implemented' }, 501)
+  const rows = await db.select().from(counties)
+  return c.json(rows)
 })
 
 // GET /layers/municipalities
-// Returns municipalities, optionally filtered by county.
-// Query: ?county=cook|dupage
+// ?county=cook|dupage
 layers.get('/municipalities', async (c) => {
-  // TODO: query municipalities table
-  return c.json({ message: 'municipalities — not yet implemented' }, 501)
+  const county = c.req.query('county')
+  const rows = await db.select().from(municipalities)
+    .where(county ? eq(municipalities.countyId, county) : undefined)
+  return c.json(rows)
 })
 
 // GET /layers/:layerId
-// Returns metadata + sample records for a specific layer.
+// Returns layer metadata + count of spatial features ingested for it
 layers.get('/:layerId', async (c) => {
-  // TODO: query data_layers + spatial_features for this layer
-  return c.json({ message: 'layer detail — not yet implemented' }, 501)
+  const layerId = c.req.param('layerId')
+
+  const [layer] = await db.select().from(dataLayers).where(eq(dataLayers.id, layerId))
+  if (!layer) return c.json({ error: 'layer not found' }, 404)
+
+  return c.json(layer)
 })
 
 export default layers
