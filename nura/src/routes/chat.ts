@@ -1,14 +1,20 @@
 import { Hono } from 'hono'
+import { runAgent, type Message } from '../chat/agent'
 
 const chat = new Hono()
 
 // POST /chat
-// Accepts a user message, runs the LLM agent loop with tool calling,
-// and streams back the response.
-// Body: { message: string, thread_id?: string }
+// Body: { message: string, history?: Message[] }
 chat.post('/', async (c) => {
-  // TODO: implement LLM agent loop with tool calling
-  return c.json({ message: 'chat route — not yet implemented' }, 501)
+  const body = await c.req.json()
+  const { message, history = [] } = body
+
+  if (!message?.trim()) {
+    return c.json({ error: 'message is required' }, 400)
+  }
+
+  const reply = await runAgent(message, history)
+  return c.json({ reply })
 })
 
 export default chat
