@@ -279,6 +279,7 @@ export const documentChunks = pgTable('document_chunks', {
   chunkText:      text('chunk_text').notNull(),
   sectionId:      varchar('section_id', { length: 50 }),  // e.g. 'Ch-07', '17.3.1'
   sourceUrl:      text('source_url'),
+  embeddedAt:     timestamp('embedded_at'),               // null = not yet sent to Pinecone
   createdAt:      timestamp('created_at').defaultNow().notNull(),
 })
 

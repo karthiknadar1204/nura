@@ -9,6 +9,7 @@
   "dependencies": {
     "@mendable/firecrawl-js": "^4.16.0",
     "@neondatabase/serverless": "^1.0.2",
+    "@pinecone-database/pinecone": "^7.1.0",
     "drizzle-orm": "^0.45.1",
     "hono": "^4.12.8",
     "openai": "^6.29.0",

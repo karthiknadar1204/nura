@@ -7,6 +7,7 @@ import { municipalities, ingestionJobs } from '../../db/schema'
 import { MunicodeAdapter } from './adapters/municode'
 import type { ZoningAdapter } from './adapters/interface'
 import { storeChunks, storeStructuredData, extractStructuredData } from './parser'
+import { embedAndUpsertChunks } from '../../vector/client'
 
 const INTER_REQUEST_DELAY_MS = 300
 
@@ -39,9 +40,10 @@ export async function runMunicipalIngestion(municipalityId: string): Promise<voi
 
   let processed = 0
   let failed    = 0
+  let adapter: ZoningAdapter | undefined
 
   try {
-    const adapter = getAdapter(muni.zoningSource)
+    adapter = getAdapter(muni.zoningSource)
     const toc     = await adapter.fetchTableOfContents(municipalityId)
 
     console.log(`[municipal:${municipalityId}] ${toc.length} chapters in TOC`)
@@ -85,6 +87,10 @@ export async function runMunicipalIngestion(municipalityId: string): Promise<voi
     await db.update(municipalities)
       .set({ lastScrapedAt: new Date() })
       .where(eq(municipalities.id, municipalityId))
+
+    // Embed all chunks and upsert to Pinecone
+    const embeddedCount = await embedAndUpsertChunks(municipalityId)
+    console.log(`[municipal:${municipalityId}] ${embeddedCount} vectors upserted to Pinecone`)
 
     // Complete job
     await db.update(ingestionJobs).set({

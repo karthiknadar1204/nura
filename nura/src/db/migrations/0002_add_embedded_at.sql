@@ -1,0 +1,1 @@
+ALTER TABLE document_chunks ADD COLUMN IF NOT EXISTS embedded_at TIMESTAMP;
