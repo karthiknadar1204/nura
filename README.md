@@ -391,22 +391,303 @@ This pipeline:
 
 ---
 
-## Chat Tools
+## The Chat Endpoint — `POST /chat`
 
-The chat endpoint (`POST /chat`) runs an LLM agent that has access to 10 structured tools:
+```
+POST /chat
+{ "message": "How many parcels in DuPage County are in flood zone AE?", "history": [] }
+```
 
-| Tool | What it queries |
-|---|---|
-| `search_parcels` | `parcels_dupage` by address, owner, flood zone |
-| `get_flood_zone_summary` | Aggregates flood zone counts by zone type and by municipality |
-| `get_parcels_in_flood_zone` | All parcels matching a specific flood zone |
-| `list_zoning_districts` | All districts for a municipality |
-| `get_permitted_uses` | Permitted/conditional/prohibited uses for a district |
-| `get_development_standards` | Setbacks, height, coverage for a district |
-| `compare_districts` | Side-by-side standards for two districts |
-| `search_ordinance_text` | Pinecone semantic search over ordinance chunks |
-| `list_available_layers` | What data layers are available |
-| `get_municipality_summary` | Parcel counts, flood stats, districts for a municipality |
+- `message` — the user's question
+- `history` — optional array of previous turns (`{ role, content }`) for multi-turn conversation
+
+Returns:
+```json
+{ "reply": "There are 82 parcels in DuPage County designated flood zone AE..." }
+```
+
+---
+
+### How the agent works (`chat/agent.ts`)
+
+The chat endpoint runs a **ReAct-style LLM agent loop** using GPT-4o with OpenAI function calling. Here is what happens on every request:
+
+**1. Build the system prompt** (`chat/prompt.ts`)
+
+Before calling the LLM, we query the live database to get current counts:
+```sql
+SELECT COUNT(*), COUNT(*) FILTER (WHERE flood_zone IS NOT NULL) FROM parcels_dupage
+SELECT COUNT(*) FROM zoning_districts
+SELECT COUNT(*) FROM document_chunks
+```
+
+These numbers are injected into the system prompt so the LLM knows exactly what data it has access to — e.g. "3,999 parcels, 82 in flood zones, 29 zoning districts, 1,200 searchable ordinance chunks." The system prompt also contains hard rules (explained below).
+
+**2. The agent loop**
+
+```
+LLM call → tool calls? → execute tools → feed results back → LLM call → ... → final answer
+```
+
+The loop runs up to 5 iterations:
+- We send the system prompt + conversation history + user message to GPT-4o with all 10 tool definitions attached
+- GPT-4o responds with either a final text answer OR a list of `tool_calls` it wants to make
+- If there are tool calls, we execute all of them **in parallel** using `Promise.all`, then append the results to the message history
+- We call the LLM again with the tool results included
+- This repeats until the LLM returns a text answer with no tool calls, or we hit 5 iterations
+
+**Why parallel tool calls:** GPT-4o can request multiple tools in a single response (e.g. "I need to call `get_permitted_uses` AND `get_development_standards`"). We execute them concurrently so complex multi-step questions don't take 2–3x longer.
+
+**3. Tool dispatch** (`chat/executor.ts`)
+
+A simple switch statement routes each tool name to its handler function in `tools/handlers.ts`. If an unknown tool name arrives, it returns `{ error: "Unknown tool" }`.
+
+---
+
+### The System Prompt and Hard Rules
+
+The system prompt is not static — it's rebuilt on every request with live DB counts. It contains:
+
+**Tool selection guide:** Tells the LLM which tool to use for which type of question. Without this, GPT-4o would sometimes call `search_ordinance_text` for a simple parcel lookup, which is slow and returns irrelevant results.
+
+**Four hard rules that were added to fix specific bugs found in evaluation:**
+
+**Rule 1 — Parcel ↔ Zoning linkage does NOT exist**
+The LLM was hallucinating zoning districts from street addresses (e.g. "304 S RT 59 is a highway corridor so it's probably B1 commercial"). The rule explicitly tells it: the parcel table has no `zoning_code` column, never infer a zone from an address, always tell the user to check the official zoning map instead.
+
+**Rule 2 — Always report total count**
+Tool responses include `total_count` and `truncated` fields. The LLM was sometimes only reporting the number of returned rows (20) instead of the true total (82). The rule forces it to always surface the real total and flag truncation.
+
+**Rule 3 — Flood zone counting — use `by_flood_zone` totals**
+The `get_flood_zone_summary` tool returns two separate aggregations: `by_flood_zone` (county-wide count per zone type) and `by_municipality` (total flood parcels per municipality). Without this rule, the LLM would use the wrong one for the wrong question — summing `by_municipality` rows to get an AE count (wrong) instead of reading `by_flood_zone` directly (right).
+
+**Rule 4 — RAG fallback is mandatory when structured data is incomplete**
+The structured tables (`development_standards`, `permitted_uses`) only have data for B1 and RD districts. For all other districts they return empty. When `get_development_standards` returns a `note` field listing missing standards, the LLM MUST call `search_ordinance_text` before answering — it cannot just say "no data found."
+
+---
+
+### The 10 Tools
+
+Each tool is defined in `chat/tools.ts` in OpenAI function-calling format (name, description, JSON Schema for parameters). The handler that actually runs is in `tools/handlers.ts`.
+
+---
+
+#### 1. `search_parcels`
+
+**What it does:** Searches `parcels_dupage` by any combination of address fragment, owner name, municipality ID, and flood zone. Uses `ILIKE '%fragment%'` for text fields (case-insensitive, partial match) and exact `=` for municipality and flood zone.
+
+**Why `ILIKE`:** Parcel addresses in the DB are stored as-is from ArcGIS — all caps, inconsistent spacing. `ILIKE '%goldenrod%'` catches `1333 GOLDENROD DR NAPERVILLE 60540` without the user needing to know the exact format.
+
+**Key detail — `total_count` + `truncated`:** The handler runs two queries: one `COUNT(*)` for the true total, one with `LIMIT` for the actual rows. Both are returned so the LLM can tell the user "there are 47 matching parcels, here are the first 20."
+
+**Key detail — `zoning_district: null` and `data_note`:** Every parcel in the response has `zoning_district: null` explicitly set, plus a `data_note` saying "never infer a zoning district from an address." This makes the tool result itself block hallucination, not just the system prompt.
+
+**Parameters:** `address`, `owner`, `municipality`, `flood_zone`, `limit`
+
+---
+
+#### 2. `get_flood_zone_summary`
+
+**What it does:** Returns two separate aggregations:
+- `by_flood_zone` — `GROUP BY flood_zone` (ignoring municipality). Answers "how many AE parcels are in DuPage County?" accurately, including parcels with `municipality_id = NULL`.
+- `by_municipality` — `GROUP BY municipality_id` (ignoring zone type). Answers "which municipality has the most flood parcels?"
+
+**Why two separate aggregations:** The original implementation grouped by `(flood_zone, municipality_id)` together. The LLM summed only the named-municipality rows and missed ~40 AE parcels with `municipality_id = NULL`, reporting 20 instead of 82. Splitting into two separate queries fixed this.
+
+**Parameters:** `municipality` (optional — filters both aggregations to a single city)
+
+---
+
+#### 3. `list_zoning_districts`
+
+**What it does:** Returns all rows from `zoning_districts` for a given municipality — district code (R1A, B1, RD), full name, category (residential/commercial/industrial), and description.
+
+**Parameters:** `municipality` (required — `naperville` or `evanston`)
+
+---
+
+#### 4. `get_permitted_uses`
+
+**What it does:** Looks up the district UUID from `zoning_districts`, then queries `permitted_uses` joined to that district. Returns each use with its `permit_type`: `by_right` (allowed as-of-right), `conditional` (needs approval), `prohibited`, or `accessory`.
+
+**When structured data is empty:** If the district has no rows in `permitted_uses` (e.g. R1A, R3 — not yet extracted), the response includes a `note` field: `"No structured permitted uses extracted. Use search_ordinance_text..."`. The system prompt's hard rule forces the LLM to call `search_ordinance_text` when it sees this note.
+
+**Parameters:** `municipality`, `district_code`, `permit_type` (optional filter)
+
+---
+
+#### 5. `get_development_standards`
+
+**What it does:** Queries `development_standards` for a district. Returns standards like `min_lot_sqft: 7500`, `max_height_ft: 35`, `front_setback_ft: 25`, etc.
+
+**Deduplication:** Re-ingestion runs sometimes insert duplicate rows (same standard, same value). The handler deduplicates them in-memory using a `Set` keyed on `${standard}|${value}|${unit}` before returning.
+
+**Missing standards note:** We define a list of 9 common standard types (`COMMON_STANDARDS`). After querying, we check which ones are absent from the results. If any are missing, the response includes a `note` listing them: `"These standard types are not in structured data: front_setback_ft, side_setback_ft. Look them up via search_ordinance_text."` This triggers the mandatory RAG fallback in the system prompt.
+
+**Parameters:** `municipality`, `district_code`
+
+---
+
+#### 6. `compare_districts`
+
+**What it does:** Calls `getDevelopmentStandards` twice — once for district A and once for district B — and returns both results side by side. Districts can be from the same or different municipalities (e.g. Naperville RD vs Naperville B1, or Naperville B1 vs Evanston B2).
+
+**Parameters:** `municipality_a`, `district_code_a`, `municipality_b`, `district_code_b`
+
+---
+
+#### 7. `search_ordinance_text`
+
+**What it does:** Semantic search over all ingested ordinance text chunks. This is the RAG (Retrieval-Augmented Generation) tool — it finds the most relevant passages from the zoning ordinance to answer nuanced questions that aren't in the structured tables.
+
+**How it works — two-stage with fallback:**
+
+**Stage 1 — Pinecone semantic search:**
+1. The query string is sent to OpenAI's `text-embedding-3-small` model, which converts it into a 1,536-dimensional vector (a list of numbers representing the semantic meaning)
+2. That vector is sent to Pinecone, which finds the stored ordinance chunk vectors that are most similar (cosine similarity)
+3. Pinecone stores chunks in **namespaces** — one per municipality (`naperville`, `evanston`). If `municipality` is specified, we query only that namespace. Otherwise we query both and merge the results.
+4. Results are re-ranked by similarity score and the top-K are returned.
+
+**Stage 2 — Keyword fallback:**
+If Pinecone is unavailable or returns no results, we fall back to a simple `ILIKE '%query%'` search against the `document_chunks` table in Postgres.
+
+**What are "chunks":** Each zoning ordinance is split into sections (e.g. Chapter 7, Section 17.3.1). Each section is stored as a `document_chunk` row with its full text, section ID, source URL, and municipality. The same UUID is used as both the Postgres primary key and the Pinecone vector ID, so after Pinecone returns a list of vector IDs we can hydrate the full text from Postgres.
+
+**Parameters:** `query`, `municipality` (optional), `limit`
+
+---
+
+#### 8. `get_parcels_in_flood_zone`
+
+**What it does:** Returns all parcels with a specific FEMA flood zone, optionally filtered to a municipality. Similar to `search_parcels` but flood-zone-first and includes `total_count` + `truncated`.
+
+**Dirty data normalisation — `UPPER(TRIM(...))` in the SQL query:**
+
+The flood zone values stored in the DB are inconsistent because they came from multiple different ArcGIS layers, each with slightly different formatting. The same FEMA zone appears as:
+- `"AE"` in one layer
+- `"ZONE AE"` in another
+- `"ae"` or `" AE "` (with whitespace) in others
+
+If you run a naive `WHERE flood_zone = 'AE'` you miss every row that doesn't match exactly. The fix works in two parts:
+
+**Part 1 — normalise the user's input in TypeScript before the query:**
+```ts
+const normalised = flood_zone.replace(/^ZONE\s+/i, '').trim().toUpperCase()
+// "zone ae" → "AE", " AE " → "AE", "ZONE AE" → "AE"
+```
+
+**Part 2 — normalise the stored DB value inside the SQL query itself:**
+```ts
+sql`UPPER(TRIM(${parcelsDupage.floodZone})) = ${normalised}`
+```
+
+`TRIM()` is a built-in Postgres string function that strips leading and trailing whitespace from a value. `UPPER()` converts it to uppercase. By wrapping the DB column in both, we ensure both sides of the `=` comparison are in the same canonical form (`"AE"`) regardless of how the data was originally stored.
+
+**Why this matters for retrieval:** Without this, a user asking "parcels in flood zone AE" would get 40 results instead of 82, silently missing every parcel whose `flood_zone` column has a space, different casing, or the "ZONE " prefix. The normalisation makes the query robust to source data inconsistencies without needing to clean up the stored data.
+
+**Parameters:** `flood_zone` (required), `municipality`, `limit`
+
+---
+
+#### 9. `list_available_layers`
+
+**What it does:** Returns rows from `data_layers` — the registry of every GIS layer discovered during ingestion. Useful when the user asks "what data do you have?" or "is there school district data available?"
+
+**Parameters:** `county`, `layer_type` (both optional filters)
+
+---
+
+#### 10. `get_municipality_summary`
+
+**What it does:** Returns a high-level overview for a municipality by running 3 separate count queries:
+- `COUNT(*)` from `parcels_dupage` WHERE `municipality_id = ?`
+- `COUNT(*)` from `zoning_districts` WHERE `municipality_id = ?`
+- `COUNT(*)` from `document_chunks` WHERE `municipality_id = ?`
+
+Also returns metadata from the `municipalities` table: county, zoning source (PDF/Municode/eCode360), and last scrape timestamp.
+
+**Parameters:** `municipality` (required)
+
+---
+
+### `pg_trgm` — Fuzzy Search (`GET /search/parcels`)
+
+`pg_trgm` is a **PostgreSQL extension** that enables fuzzy text matching based on trigrams. A trigram is every sequence of 3 consecutive characters in a string — `"GOLDENROD"` becomes `["GOL", "OLD", "LDE", "DEN", "ENR", "NRO", "ROD"]`. Two strings are considered similar if they share enough trigrams.
+
+This powers the `GET /search/parcels?q=...` endpoint — a separate, dedicated search endpoint distinct from the LLM chat tools.
+
+**Why it exists:** The `ILIKE '%fragment%'` used in the chat tools requires the user to spell things exactly right. `pg_trgm` handles typos, partial words, and fuzzy input — e.g. `"goldenrd"` still finds `"GOLDENROD DR"`.
+
+**How it is set up:**
+
+`setup.sql` enables the extension once on the Neon database:
+```sql
+CREATE EXTENSION IF NOT EXISTS pg_trgm;
+```
+
+`0001_spatial_indexes.sql` creates GIN trigram indexes on the address columns:
+```sql
+CREATE INDEX idx_parcels_dupage_address_trgm
+  ON parcels_dupage USING GIN (address gin_trgm_ops);
+```
+
+A **GIN** (Generalized Inverted Index) on `gin_trgm_ops` pre-computes all the trigrams for every address and stores them in an inverted index — so instead of scanning every row at query time, Postgres looks up matching trigrams instantly.
+
+**How the query works** (`routes/search.ts`):
+
+```sql
+SELECT pin, address, owner_name, ...,
+  GREATEST(
+    similarity(LOWER(address),    LOWER($q)),
+    similarity(LOWER(owner_name), LOWER($q)),
+    similarity(LOWER(pin),        LOWER($q))
+  ) AS score
+FROM parcels_dupage
+WHERE
+  LOWER(address)    % LOWER($q)
+  OR LOWER(owner_name) % LOWER($q)
+  OR LOWER(pin)     % LOWER($q)
+ORDER BY score DESC
+LIMIT 10
+```
+
+- `%` is the pg_trgm **similarity operator** — returns true if the trigram similarity between two strings exceeds the threshold (default 0.3). This is what filters rows using the GIN index.
+- `similarity(a, b)` returns a float 0–1 score. We compute it against all three columns (address, owner name, PIN) and take the `GREATEST` so the best-matching column wins.
+- Results are ordered by score descending — the closest match comes first.
+- We lowercase both sides so `"goldenrod"` matches `"GOLDENROD DR"`.
+
+**Why it helps with retrieval:**
+
+| Query | `ILIKE` result | `pg_trgm` result |
+|---|---|---|
+| `"goldenrd dr"` | no match | matches `"GOLDENROD DR"` |
+| `"naprvile park"` | no match | matches `"NAPERVILLE PARK DISTRICT"` |
+| `"1333 gldnrod"` | no match | matches `"1333 GOLDENROD DR"` |
+
+Without `pg_trgm`, a user has to know the exact address format stored in the DB. With it, approximate input works.
+
+**`/search/parcels` vs `search_parcels` tool:** These are two different things. The `GET /search/parcels` endpoint is for direct programmatic/UI use with fuzzy matching. The `search_parcels` LLM tool uses `ILIKE` inside the chat agent — simpler but requires closer spelling. The two complement each other.
+
+---
+
+### Pinecone + RAG Architecture
+
+Pinecone is a **vector database** — instead of searching by exact text match, it searches by semantic meaning. Here's how it fits into the system:
+
+**At ingest time** (`/ingest/municipal`):
+1. The municipal ordinance is scraped and split into chunks (~500–1000 tokens each)
+2. Each chunk is embedded using OpenAI `text-embedding-3-small` into a 1,536-dimensional vector
+3. The vector is upserted into Pinecone under the municipality's namespace (`naperville` or `evanston`)
+4. The chunk text and metadata (section ID, source URL, municipality) are stored in the `document_chunks` Postgres table
+5. The Pinecone vector ID = the Postgres UUID, linking the two stores
+
+**At query time** (`search_ordinance_text`):
+1. The user's query is embedded with the same model
+2. Pinecone finds the top-K most similar stored vectors (cosine similarity score 0–1)
+3. The full chunk text is returned from the metadata stored alongside the vector in Pinecone
+4. Results from all queried namespaces are merged and re-sorted by score
+
+**Why namespaces:** Pinecone namespaces act like separate indexes within one index. By storing Naperville and Evanston chunks in separate namespaces, a municipality-scoped query only searches that namespace and doesn't waste `topK` slots on results from the other city.
 
 ---
 
