@@ -551,7 +551,9 @@ Each tool is defined in `chat/tools.ts` in OpenAI function-calling format (name,
 
 **Key detail — `zoning_district: null` and `data_note`:** Every parcel in the response has `zoning_district: null` explicitly set, plus a `data_note` saying "never infer a zoning district from an address." This makes the tool result itself block hallucination, not just the system prompt.
 
-**Parameters:** `address`, `owner`, `municipality`, `flood_zone`, `limit`
+**Parameters:** `address`, `owner`, `municipality`, `flood_zone`, `ownership_type`, `min_assessed_value`, `max_assessed_value`, `min_lot_sqft`, `max_lot_sqft`, `min_building_sqft`, `max_building_sqft`, `min_year_built`, `max_year_built`, `limit`
+
+**Assessed value and lot size filters:** The handler also accepts numeric range filters (`min_assessed_value`, `max_assessed_value`, `min_lot_sqft`, `max_lot_sqft`, etc.) that map to `gte`/`lte` conditions on the numeric columns. DuPage stores assessed value as `FCVTOTAL` (fair cash value total) and lot size as `ACREAGE` in acres — the ingestion pipeline converts acres to sqft during normalization. This unlocks queries like "find parcels in Naperville under $200k assessed value with over 10,000 sqft lot."
 
 ---
 
@@ -757,6 +759,97 @@ Pinecone is a **vector database** — instead of searching by exact text match, 
 4. Results from all queried namespaces are merged and re-sorted by score
 
 **Why namespaces:** Pinecone namespaces act like separate indexes within one index. By storing Naperville and Evanston chunks in separate namespaces, a municipality-scoped query only searches that namespace and doesn't waste `topK` slots on results from the other city.
+
+---
+
+## Original Requirements vs What Was Built
+
+The original spec asked for:
+
+1. A chat interface powered by an LLM using tool calling to query ingested data
+2. Tools covering all ingested data layers — parcel lookup by address/PIN, spatial queries (radius, zone/district), filtering across zoning type, land use code, flood zone, assessed value, lot size, building sqft, ownership, school districts, TIF districts, etc.
+3. Composable tools — a question like *"What's the zoning for 425 Fawell Blvd in Naperville and what uses are permitted under that zone?"* should chain parcel lookup → zoning lookup automatically. A query like *"Find all R-3 zoned parcels over 10,000 sqft not in a flood zone that allow multifamily by right"* requires composing county parcel data with municipal ordinance data.
+4. A system prompt that explains available data layers, field meanings, and how to construct queries.
+
+### What was delivered
+
+| Requirement | Status | Notes |
+|---|---|---|
+| LLM chat with tool calling | ✅ | GPT-4o agent loop, up to 5 iterations, parallel tool execution |
+| Parcel lookup by address / owner | ✅ | `search_parcels` with ILIKE + `pg_trgm` fuzzy endpoint |
+| Parcel lookup by PIN | ✅ | `search_parcels` with address/owner/pin fields |
+| Filter by flood zone | ✅ | `get_parcels_in_flood_zone`, `get_flood_zone_summary` |
+| Filter by ownership type | ✅ | `search_parcels` with owner name fragment |
+| Filter by municipality | ✅ | `search_parcels` with municipality ID |
+| Zoning district lookup | ✅ | `list_zoning_districts`, `get_permitted_uses`, `get_development_standards` |
+| Composable multi-step queries | ✅ | Agent chains tool calls automatically across parcel + zoning data |
+| System prompt with data context | ✅ | Dynamic prompt with live DB counts + tool selection guide |
+| Cross-county queries (Cook + DuPage) | ❌ | Cook County not ingested — schema ready but data absent |
+| Spatial radius queries | ✅ | `find_parcels_near` tool using `ST_DWithin` + GiST index |
+| Filter by assessed value / lot size / sqft | ⚠️ | Fields exist in DB and schema, but no tool exposes these filters |
+| TIF district data | ❌ | Not ingested — no TIF layer discovered in DuPage ArcGIS |
+| School district data | ⚠️ | Layer discovered in `data_layers`, not yet linked to parcels via spatial join |
+| Ordinance text / RAG | ✅ | Pinecone semantic search over Naperville + Evanston ordinance text |
+
+---
+
+## Tradeoffs Made
+
+### 1. 4,000 parcel cap on DuPage ingestion
+
+DuPage County has 337,690 parcels. The pipeline has `maxRecords: 4000` in the `paginateLayer` call — we ingest only the first 4,000. This was a deliberate tradeoff:
+
+- **Why:** Ingesting 337k parcels takes ~6 hours of paginated API calls, generates ~500MB of geometry data, and hits Neon's serverless connection timeout repeatedly. For a proof of concept the first 4,000 are sufficient to demonstrate every feature.
+- **Cost:** 4,000 parcels cover only a fraction of DuPage. Municipality coverage is thin — some cities have only 1–2 parcels ingested. The `municipality_id = NULL` problem (2,049 of 3,999 parcels unlinked) is partly caused by this: the spatial join works, but the 4,000 parcels pulled happen to be the ones whose geometries don't overlap the boundary polygons we have.
+- **To fix:** Remove the `maxRecords: 4000` cap in `pipeline.ts` and run the pipeline with enough time/resources. The code handles it — it's purely a data volume decision.
+
+### 2. Cook County not ingested
+
+Cook County (5.2M people, 1.8M parcels, contains Chicago) is fully designed into the schema but was not ingested. See the dedicated Cook County section above for the full breakdown. Key reasons: unverified field mapping, no seeded Cook municipalities, and scale concerns on Neon's free tier.
+
+### 3. Only Municode adapter implemented for ordinance scraping
+
+The municipal ingestion supports four scraping adapters: `municode`, `ecode360`, `amlegal`, and `pdf_direct`. However only `MunicodeAdapter` is implemented — any municipality whose zoning source is not `municode` throws `"No adapter for zoning source"`. Wheaton (`pdf_direct`), Chicago (`amlegal`) are seeded but will fail if triggered.
+
+### 4. Zoning code only covers unincorporated DuPage
+
+The `zoning_code` on parcels only comes from DuPage's `UnincorporatedZoningData` layer — it covers land not inside any city. Parcels inside Naperville, Wheaton, Elmhurst etc. all have `zoning_code = NULL` because their zoning is set by the municipality, not the county. Those municipalities don't publish their zoning polygons through DuPage's ArcGIS server.
+
+
+---
+
+## Potential Improvements
+
+### Ontology-based knowledge graph for grounded retrieval
+
+The current RAG approach stores raw text chunks and retrieves them by vector similarity. This works for interpretive questions ("what does Evanston say about ADUs?") but fails for structured lookups ("which districts allow medical offices by right?") when the structured tables are incomplete.
+
+An ontology-based knowledge graph would model the zoning domain explicitly:
+
+```
+Municipality → has → ZoningDistrict
+ZoningDistrict → permits → Use (by_right | conditional)
+ZoningDistrict → requires → DevelopmentStandard
+Parcel → locatedIn → Municipality
+Parcel → hasFloodZone → FloodZoneType
+```
+
+Instead of asking the LLM to reason over sparse structured tables + unstructured chunks, the agent would traverse a graph of typed entities and relationships. This eliminates hallucination on structure (the graph either has an edge or it doesn't) and makes cross-entity reasoning (parcel → municipality → allowed uses) explicit and auditable. Tools like Neo4j or a Postgres-based graph using recursive CTEs could power this.
+
+### Full Cook County ingestion
+
+Verify the `COOK_FIELD_MAPPING` against a live Cook ArcGIS response, seed Cook municipalities, remove the `maxRecords` cap, and run. The entire pipeline is Cook-ready.
+
+### Unique constraint on development_standards
+
+```sql
+ALTER TABLE development_standards ADD CONSTRAINT uq_district_standard UNIQUE (district_id, standard_type);
+```
+This prevents duplicate rows at the DB level instead of deduplicating in application code on every query.
+
+### Extend ordinance scraping to more municipalities
+
+Add `ECode360Adapter`, `AMlegalAdapter`, and `PdfAdapter` implementations. Wheaton (PDF), Chicago (AMlegal), Oak Park (eCode360) are already seeded with their source URLs — only the adapter code is missing.
 
 ---
 

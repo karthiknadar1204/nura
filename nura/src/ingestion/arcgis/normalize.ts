@@ -41,16 +41,16 @@ export const DUPAGE_FIELD_MAPPING: FieldMapping = {
   ownerName:        'PROPNAME',
   ownerAddress:     'BILLADDRL1',
   ownerAddress2:    'BILLADDRL2',
-  // Assessment fields — present in full viewer layers, null in report layer
-  legalDescription: 'LEGALDESC',
-  landUseCode:      'LANDUSE',
+  // Assessment fields — DuPage uses FCVTOTAL/FCVLAND/FCVIMP, lot in ACREAGE
+  legalDescription: 'LEGALDES1',
+  landUseCode:      'PROPCLASS',
   zoningCode:       'ZONING_CLASS',
-  assessedValue:    'ASSESS_VAL',
-  landValue:        'LAND_VAL',
-  buildingValue:    'BLDG_VAL',
-  lotAreaSqft:      'LOT_AREA',
-  buildingSqft:     'BLDG_SQFT',
-  yearBuilt:        'YR_BUILT',
+  assessedValue:    'FCVTOTAL',
+  landValue:        'FCVLAND',
+  buildingValue:    'FCVIMP',
+  lotAreaSqft:      'ACREAGE',   // acres — converted to sqft in normalizeFeature
+  buildingSqft:     'BLDG_SQFT', // not present in this layer; stays null
+  yearBuilt:        'YR_BUILT',  // not present in this layer; stays null
 }
 
 export const COOK_FIELD_MAPPING: FieldMapping = {
@@ -165,7 +165,15 @@ export function normalizeFeature(
     assessedValue:    pick(attributes, fieldMapping['assessedValue']),
     landValue:        pick(attributes, fieldMapping['landValue']),
     buildingValue:    pick(attributes, fieldMapping['buildingValue']),
-    lotAreaSqft:      pick(attributes, fieldMapping['lotAreaSqft']),
+    lotAreaSqft:      (() => {
+      const raw = pick(attributes, fieldMapping['lotAreaSqft'])
+      if (!raw) return null
+      const n = parseFloat(raw)
+      if (isNaN(n)) return null
+      // DuPage stores lot size in acres (ACREAGE field) — convert to sqft
+      const isAcres = fieldMapping['lotAreaSqft'] === 'ACREAGE'
+      return String(isAcres ? Math.round(n * 43560) : n)
+    })(),
     buildingSqft:     pick(attributes, fieldMapping['buildingSqft']),
     yearBuilt:        (() => {
       const y = pick(attributes, fieldMapping['yearBuilt'])

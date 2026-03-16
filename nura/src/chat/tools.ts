@@ -7,8 +7,9 @@ export const toolDefinitions = [
     function: {
       name: 'search_parcels',
       description:
-        'Search DuPage County parcel records by address, owner name, municipality, or flood zone. ' +
-        'Returns PIN, address, owner, municipality, and flood zone for each matching parcel.',
+        'Search DuPage County parcel records by address, owner name, municipality, flood zone, ownership type, ' +
+        'assessed value range, lot size, building sqft, or year built. ' +
+        'Returns PIN, address, owner, municipality, flood zone, assessed value, lot area, building sqft, and year built for each matching parcel.',
       parameters: {
         type: 'object',
         properties: {
@@ -16,6 +17,15 @@ export const toolDefinitions = [
           owner:        { type: 'string', description: 'Partial owner name (e.g. "Forest Preserve")' },
           municipality: { type: 'string', description: 'Municipality ID: naperville | wheaton | elmhurst | downers_grove | lombard | glen_ellyn | villa_park | carol_stream | warrenville | westmont' },
           flood_zone:   { type: 'string', description: 'FEMA flood zone code: A | AE | FW | X' },
+          ownership_type: { type: 'string', enum: ['individual', 'corporate', 'trust', 'government'], description: 'Filter by ownership type' },
+          min_assessed_value: { type: 'number', description: 'Minimum assessed value in dollars' },
+          max_assessed_value: { type: 'number', description: 'Maximum assessed value in dollars' },
+          min_lot_sqft:       { type: 'number', description: 'Minimum lot area in square feet' },
+          max_lot_sqft:       { type: 'number', description: 'Maximum lot area in square feet' },
+          min_building_sqft:  { type: 'number', description: 'Minimum building square footage' },
+          max_building_sqft:  { type: 'number', description: 'Maximum building square footage' },
+          min_year_built:     { type: 'number', description: 'Minimum year the structure was built' },
+          max_year_built:     { type: 'number', description: 'Maximum year the structure was built' },
           limit:        { type: 'number', description: 'Max results to return (default 20)' },
         },
       },
@@ -132,6 +142,28 @@ export const toolDefinitions = [
           limit:        { type: 'number', description: 'Max chunks to return (default 5)' },
         },
         required: ['query'],
+      },
+    },
+  },
+
+  {
+    type: 'function' as const,
+    function: {
+      name: 'find_parcels_near',
+      description:
+        'Find parcels within a given radius (in metres) of a lat/lng point. ' +
+        'Returns parcels sorted by distance ascending. Optionally filter by flood zone or ownership type.',
+      parameters: {
+        type: 'object',
+        properties: {
+          lat:            { type: 'number', description: 'Latitude of the centre point' },
+          lon:            { type: 'number', description: 'Longitude of the centre point' },
+          radius_meters:  { type: 'number', description: 'Search radius in metres (e.g. 500 for half a kilometre)' },
+          flood_zone:     { type: 'string', description: 'Optional FEMA flood zone filter: A | AE | FW | X' },
+          ownership_type: { type: 'string', enum: ['individual', 'corporate', 'trust', 'government'], description: 'Optional ownership type filter' },
+          limit:          { type: 'number', description: 'Max results (default 20)' },
+        },
+        required: ['lat', 'lon', 'radius_meters'],
       },
     },
   },

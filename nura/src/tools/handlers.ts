@@ -18,19 +18,44 @@ import {
 // Look up parcels by address fragment, owner name, municipality, or flood zone.
 
 export async function searchParcels(args: {
-  address?:       string
-  owner?:         string
-  municipality?:  string
-  flood_zone?:    string
-  limit?:         number
+  address?:           string
+  owner?:             string
+  municipality?:      string
+  flood_zone?:        string
+  ownership_type?:    string
+  min_assessed_value?: number
+  max_assessed_value?: number
+  min_lot_sqft?:       number
+  max_lot_sqft?:       number
+  min_building_sqft?:  number
+  max_building_sqft?:  number
+  min_year_built?:     number
+  max_year_built?:     number
+  limit?:             number
 }) {
-  const { address, owner, municipality, flood_zone, limit = 20 } = args
+  const {
+    address, owner, municipality, flood_zone, ownership_type,
+    min_assessed_value, max_assessed_value,
+    min_lot_sqft, max_lot_sqft,
+    min_building_sqft, max_building_sqft,
+    min_year_built, max_year_built,
+    limit = 20,
+  } = args
 
   const conditions: any[] = []
-  if (address)      conditions.push(ilike(parcelsDupage.address,      `%${address}%`))
-  if (owner)        conditions.push(ilike(parcelsDupage.ownerName,     `%${owner}%`))
-  if (municipality) conditions.push(eq(parcelsDupage.municipalityId,   municipality))
-  if (flood_zone)   conditions.push(eq(parcelsDupage.floodZone,        flood_zone))
+  if (address)           conditions.push(ilike(parcelsDupage.address,       `%${address}%`))
+  if (owner)             conditions.push(ilike(parcelsDupage.ownerName,      `%${owner}%`))
+  if (municipality)      conditions.push(eq(parcelsDupage.municipalityId,    municipality))
+  if (flood_zone)        conditions.push(eq(parcelsDupage.floodZone,         flood_zone))
+  if (ownership_type)    conditions.push(eq(parcelsDupage.ownershipType,     ownership_type))
+  if (min_assessed_value != null) conditions.push(gte(parcelsDupage.assessedValue, String(min_assessed_value)))
+  if (max_assessed_value != null) conditions.push(lte(parcelsDupage.assessedValue, String(max_assessed_value)))
+  if (min_lot_sqft != null)       conditions.push(gte(parcelsDupage.lotAreaSqft,   String(min_lot_sqft)))
+  if (max_lot_sqft != null)       conditions.push(lte(parcelsDupage.lotAreaSqft,   String(max_lot_sqft)))
+  if (min_building_sqft != null)  conditions.push(gte(parcelsDupage.buildingSqft,  String(min_building_sqft)))
+  if (max_building_sqft != null)  conditions.push(lte(parcelsDupage.buildingSqft,  String(max_building_sqft)))
+  if (min_year_built != null)     conditions.push(gte(parcelsDupage.yearBuilt,     min_year_built))
+  if (max_year_built != null)     conditions.push(lte(parcelsDupage.yearBuilt,     max_year_built))
 
   const whereClause = conditions.length ? and(...conditions) : undefined
 
@@ -41,12 +66,17 @@ export async function searchParcels(args: {
 
   const rows = await db
     .select({
-      pin:          parcelsDupage.pin,
-      address:      parcelsDupage.address,
-      owner:        parcelsDupage.ownerName,
-      municipality: parcelsDupage.municipalityId,
-      flood_zone:   parcelsDupage.floodZone,
-      land_use:     parcelsDupage.landUseCode,
+      pin:            parcelsDupage.pin,
+      address:        parcelsDupage.address,
+      owner:          parcelsDupage.ownerName,
+      municipality:   parcelsDupage.municipalityId,
+      flood_zone:     parcelsDupage.floodZone,
+      ownership_type: parcelsDupage.ownershipType,
+      land_use:       parcelsDupage.landUseCode,
+      assessed_value: parcelsDupage.assessedValue,
+      lot_area_sqft:  parcelsDupage.lotAreaSqft,
+      building_sqft:  parcelsDupage.buildingSqft,
+      year_built:     parcelsDupage.yearBuilt,
     })
     .from(parcelsDupage)
     .where(whereClause)
@@ -278,7 +308,74 @@ export async function searchOrdinanceText(args: {
   return { query, search_type: 'keyword', count: rows.length, results: rows }
 }
 
-// ── 8. get_parcels_in_flood_zone ─────────────────────────────────────────────
+// ── 8. find_parcels_near ─────────────────────────────────────────────────────
+// Return parcels within a radius of a lat/lng point using ST_DWithin.
+
+export async function findParcelsNear(args: {
+  lat:           number
+  lon:           number
+  radius_meters: number
+  flood_zone?:   string
+  ownership_type?: string
+  limit?:        number
+}) {
+  const { lat, lon, radius_meters, flood_zone, ownership_type, limit = 20 } = args
+
+  const extraConditions: string[] = []
+  if (flood_zone)     extraConditions.push(`AND flood_zone = '${flood_zone.replace(/'/g, "''")}'`)
+  if (ownership_type) extraConditions.push(`AND ownership_type = '${ownership_type.replace(/'/g, "''")}'`)
+
+  const countResult = await db.execute(sql`
+    SELECT COUNT(*) AS total_count
+    FROM parcels_dupage
+    WHERE ST_DWithin(
+      geometry::geography,
+      ST_SetSRID(ST_Point(${lon}, ${lat}), 4326)::geography,
+      ${radius_meters}
+    )
+    ${sql.raw(extraConditions.join(' '))}
+    AND geometry IS NOT NULL
+  `)
+
+  const total_count = Number((countResult.rows[0] as any)?.total_count ?? 0)
+
+  const rows = await db.execute(sql`
+    SELECT
+      pin,
+      address,
+      owner_name,
+      municipality_id,
+      flood_zone,
+      ownership_type,
+      land_use_code,
+      ROUND(ST_Distance(
+        geometry::geography,
+        ST_SetSRID(ST_Point(${lon}, ${lat}), 4326)::geography
+      )::numeric, 1) AS distance_meters
+    FROM parcels_dupage
+    WHERE ST_DWithin(
+      geometry::geography,
+      ST_SetSRID(ST_Point(${lon}, ${lat}), 4326)::geography,
+      ${radius_meters}
+    )
+    ${sql.raw(extraConditions.join(' '))}
+    AND geometry IS NOT NULL
+    ORDER BY distance_meters ASC
+    LIMIT ${limit}
+  `)
+
+  return {
+    lat,
+    lon,
+    radius_meters,
+    total_count,
+    returned:  rows.rows.length,
+    truncated: total_count > rows.rows.length,
+    parcels:   rows.rows,
+  }
+}
+
+// ── 9. get_parcels_in_flood_zone ─────────────────────────────────────────────
 // Return parcels in a given flood zone, optionally filtered by municipality.
 
 export async function getParcelsInFloodZone(args: {
@@ -324,7 +421,7 @@ export async function getParcelsInFloodZone(args: {
   }
 }
 
-// ── 9. list_available_layers ─────────────────────────────────────────────────
+// ── 10. list_available_layers ────────────────────────────────────────────────
 // Show what GIS data layers have been discovered and ingested.
 
 export async function listAvailableLayers(args: {
@@ -353,7 +450,7 @@ export async function listAvailableLayers(args: {
   return { count: rows.length, layers: rows }
 }
 
-// ── 10. get_municipality_summary ─────────────────────────────────────────────
+// ── 11. get_municipality_summary ─────────────────────────────────────────────
 // High-level overview of what data exists for a municipality.
 
 export async function getMunicipalitySummary(args: { municipality: string }) {

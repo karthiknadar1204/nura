@@ -8,6 +8,7 @@ import {
   getDevelopmentStandards,
   compareDistricts,
   searchOrdinanceText,
+  findParcelsNear,
   getParcelsInFloodZone,
   listAvailableLayers,
   getMunicipalitySummary,
@@ -22,6 +23,7 @@ export async function executeTool(name: string, args: any): Promise<any> {
     case 'get_development_standards':return getDevelopmentStandards(args)
     case 'compare_districts':        return compareDistricts(args)
     case 'search_ordinance_text':    return searchOrdinanceText(args)
+    case 'find_parcels_near':        return findParcelsNear(args)
     case 'get_parcels_in_flood_zone':return getParcelsInFloodZone(args)
     case 'list_available_layers':    return listAvailableLayers(args)
     case 'get_municipality_summary': return getMunicipalitySummary(args)
