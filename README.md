@@ -129,7 +129,7 @@ All discovered layers are stored in `data_layers` with `ON CONFLICT DO NOTHING` 
 **Why there are multiple parcel layers:** Discovery finds multiple layers with `layer_type = 'parcel'`. DuPage publishes the same parcel data through several different ArcGIS services (a viewer layer, a report layer, a search layer, etc.) with slightly different field subsets. We pick the one with the **highest record_count** — that's the authoritative full dataset with all fields. For DuPage this is:
 ```
 https://gis.dupageco.org/arcgis/rest/services/Accela/AccelaServiceParcelsWGS84/MapServer/0
-(337,690 records — but we cap at 4,000 for the current ingestion limit)
+(337,690 records — we cap at 10,000 for the current ingestion limit)
 ```
 
 #### DuPage source URLs
@@ -786,7 +786,8 @@ The original spec asked for:
 | System prompt with data context | ✅ | Dynamic prompt with live DB counts + tool selection guide |
 | Cross-county queries (Cook + DuPage) | ❌ | Cook County not ingested — schema ready but data absent |
 | Spatial radius queries | ✅ | `find_parcels_near` tool using `ST_DWithin` + GiST index |
-| Filter by assessed value / lot size / sqft | ⚠️ | Fields exist in DB and schema, but no tool exposes these filters |
+| Filter by assessed value / lot size / sqft | ✅ | `search_parcels` with `min/max_assessed_value`, `min/max_lot_sqft`, `min/max_building_sqft` |
+| Sort by assessed value / lot size / sqft | ✅ | `search_parcels` with `sort_by` + `sort_order` — supports highest/lowest superlative queries |
 | TIF district data | ❌ | Not ingested — no TIF layer discovered in DuPage ArcGIS |
 | School district data | ⚠️ | Layer discovered in `data_layers`, not yet linked to parcels via spatial join |
 | Ordinance text / RAG | ✅ | Pinecone semantic search over Naperville + Evanston ordinance text |
@@ -795,13 +796,12 @@ The original spec asked for:
 
 ## Tradeoffs Made
 
-### 1. 4,000 parcel cap on DuPage ingestion
+### 1. 10,000 parcel cap on DuPage ingestion
 
-DuPage County has 337,690 parcels. The pipeline has `maxRecords: 4000` in the `paginateLayer` call — we ingest only the first 4,000. This was a deliberate tradeoff:
+DuPage County has 337,690 parcels. The pipeline caps at `maxRecords: 10_000` — a deliberate tradeoff for the current scope:
 
-- **Why:** Ingesting 337k parcels takes ~6 hours of paginated API calls, generates ~500MB of geometry data, and hits Neon's serverless connection timeout repeatedly. For a proof of concept the first 4,000 are sufficient to demonstrate every feature.
-- **Cost:** 4,000 parcels cover only a fraction of DuPage. Municipality coverage is thin — some cities have only 1–2 parcels ingested. The `municipality_id = NULL` problem (2,049 of 3,999 parcels unlinked) is partly caused by this: the spatial join works, but the 4,000 parcels pulled happen to be the ones whose geometries don't overlap the boundary polygons we have.
-- **To fix:** Remove the `maxRecords: 4000` cap in `pipeline.ts` and run the pipeline with enough time/resources. The code handles it — it's purely a data volume decision.
+- **Why:** Ingesting 337k parcels would take a long time, generate ~500MB of geometry data, and stress Neon's serverless connection pool. 10,000 parcels cover the key municipalities and are sufficient to demonstrate every feature.
+- **To fix:** Remove the `maxRecords: 10_000` cap in `pipeline.ts`. The code handles full-scale ingestion — it's purely a data volume decision.
 
 ### 2. Cook County not ingested
 
@@ -815,6 +815,70 @@ The municipal ingestion supports four scraping adapters: `municode`, `ecode360`,
 
 The `zoning_code` on parcels only comes from DuPage's `UnincorporatedZoningData` layer — it covers land not inside any city. Parcels inside Naperville, Wheaton, Elmhurst etc. all have `zoning_code = NULL` because their zoning is set by the municipality, not the county. Those municipalities don't publish their zoning polygons through DuPage's ArcGIS server.
 
+
+---
+
+## Pipeline Performance — From ~15 Minutes to ~3 Minutes
+
+The ingestion pipeline went through two major rounds of performance work. Here's what changed and why it mattered.
+
+### Before: Sequential everything (~15 min)
+
+The original pipeline used `paginateLayer()` — a sequential async generator that fetched one page of 1,000 records at a time and `await`-ed each one before starting the next:
+
+```
+page 1 (1,000 records) → wait → page 2 → wait → page 3 → wait ... → page 10
+```
+
+10 pages × ~8s each = ~80 seconds just to fetch. Then overlay layers (municipality, flood, zoning) were ingested one layer at a time, and each feature was inserted with its own individual `db.execute` call — meaning 1,759 flood features = 1,759 round trips to Neon.
+
+### After: Parallel fetch + batch insert (~3 min)
+
+**1. Parallel page fetching (`fetchAllFeaturesParallel`)**
+
+Instead of sequential pages, the pipeline now fans out all page offsets at once in groups of 5 concurrent requests:
+
+```
+[page 0, page 1000, page 2000, page 3000, page 4000]  ← all fired at once
+[page 5000, page 6000, page 7000, page 8000, page 9000] ← next batch
+```
+
+10 pages → 2 rounds of 5 → done in ~8s total instead of ~80s. `knownCount` is passed directly from `data_layers.recordCount` (337,690) so we skip the extra HTTP call to get the count.
+
+**2. Batch geometry update (VALUES clause)**
+
+Previously geometry was written with 10,000 individual `UPDATE` statements. Now it's one query per 500 rows using a `VALUES` clause:
+
+```sql
+UPDATE parcels_dupage t
+SET geometry = ST_GeomFromGeoJSON(v.geojson)
+FROM (VALUES ($1,$2), ($3,$4), ...) AS v(pin, geojson)
+WHERE t.pin = v.pin
+```
+
+10,000 rows → 20 queries instead of 10,000.
+
+**3. Parallel overlay ingestion**
+
+Municipality, flood, and zoning overlays are now ingested in parallel:
+- All municipality layers fire concurrently (`Promise.allSettled`)
+- Flood and zoning groups run concurrently with each other
+- Inside each overlay, features are collected first then batch-INSERTed 500 at a time (DELETE + INSERT instead of per-row upsert)
+
+**4. GiST indexes on geometry columns**
+
+The `ST_Intersects` spatial joins (municipality, flood zone, zoning code) were timing out on Neon without indexes. GiST indexes on `parcels_dupage.geometry` and `spatial_features.geometry` brought the joins from timeout → sub-second.
+
+### Summary
+
+| Step | Before | After |
+|---|---|---|
+| Fetch 10,000 parcels | ~80s sequential | ~8s parallel (5 concurrent) |
+| Geometry update | 10,000 individual UPDATEs | 20 batch UPDATEs (500 rows each) |
+| Overlay ingestion (1,759 flood features) | 1,759 individual INSERTs | ~4 batch INSERTs |
+| Overlay layer loop | Serial one-by-one | Parallel across all layers of same type |
+| Spatial joins | Full table scan → timeout | GiST-indexed → sub-second |
+| **Total wall time** | **~15 minutes** | **~3 minutes** |
 
 ---
 

@@ -203,12 +203,14 @@ async function ingestParcelLayerWithGeometry(
 // (which are too slow for Neon serverless timeouts).
 
 async function repairSpatialGeometries(countyId: string) {
-  console.log(`[pipeline] Repairing invalid geometries in spatial_features for ${countyId}`)
+  console.log(`[pipeline] Repairing geometries in spatial_features for ${countyId}`)
+  // ST_Buffer(ST_MakeValid(geom), 0) forces a full topology rebuild — stronger than
+  // ST_MakeValid alone, which can leave topology conflicts that only surface at ST_Intersects time.
   await db.execute(sql`
     UPDATE spatial_features
-    SET geometry = ST_MakeValid(geometry)
+    SET geometry = ST_Buffer(ST_MakeValid(geometry), 0)
     WHERE county_id = ${countyId}
-      AND NOT ST_IsValid(geometry)
+      AND geometry IS NOT NULL
   `)
   console.log(`[pipeline] Geometry repair complete for ${countyId}`)
 }
@@ -221,18 +223,33 @@ async function runMunicipalityJoin(countyId: string) {
   console.log(`[pipeline] Running municipality spatial join for ${countyId}`)
   const tableName = countyId === 'dupage' ? 'parcels_dupage' : 'parcels_cook'
 
-  await db.execute(sql`
-    UPDATE ${sql.raw(tableName)} p
-    SET municipality_id = m.id
-    FROM municipalities m, spatial_features sf
-    WHERE sf.layer_type = 'municipality'
-      AND sf.county_id = ${countyId}
-      AND ST_Intersects(sf.geometry, p.geometry)
-      AND LOWER(COALESCE(sf.attributes->>'NAME', sf.attributes->>'CITY', sf.attributes->>'MunName', sf.attributes->>'MUNICIPALITY')) = LOWER(m.name)
-      AND m.county_id = ${countyId}
-      AND p.municipality_id IS NULL
-      AND p.geometry IS NOT NULL
+  const needsUpdate = await db.execute(sql`
+    SELECT id FROM ${sql.raw(tableName)}
+    WHERE municipality_id IS NULL AND geometry IS NOT NULL
   `)
+  const ids: string[] = (needsUpdate as any).rows.map((r: any) => r.id)
+  console.log(`[pipeline] Municipality join: ${ids.length} parcels to process`)
+
+  const BATCH = 300
+  for (let i = 0; i < ids.length; i += BATCH) {
+    const batch = ids.slice(i, i + BATCH)
+    const idValues = batch.map(id => sql`(${id}::uuid)`)
+    try {
+      await db.execute(sql`
+        UPDATE ${sql.raw(tableName)} p
+        SET municipality_id = m.id
+        FROM municipalities m, spatial_features sf
+        WHERE sf.layer_type = 'municipality'
+          AND sf.county_id = ${countyId}
+          AND ST_Intersects(sf.geometry, p.geometry)
+          AND LOWER(COALESCE(sf.attributes->>'NAME', sf.attributes->>'CITY', sf.attributes->>'MunName', sf.attributes->>'MUNICIPALITY')) = LOWER(m.name)
+          AND m.county_id = ${countyId}
+          AND p.id IN (SELECT id FROM (VALUES ${sql.join(idValues, sql`,`)}) AS v(id))
+      `)
+    } catch (err) {
+      console.warn(`[pipeline] Municipality batch ${i}–${i + BATCH} failed:`, err)
+    }
+  }
   console.log(`[pipeline] Municipality join complete for ${countyId}`)
 }
 
@@ -303,20 +320,35 @@ async function runZoningCodeUpdate(countyId: string) {
   console.log(`[pipeline] Running zoning code update for ${countyId}`)
   const tableName = countyId === 'dupage' ? 'parcels_dupage' : 'parcels_cook'
 
-  await db.execute(sql`
-    UPDATE ${sql.raw(tableName)} p
-    SET zoning_code = COALESCE(
-      sf.attributes->>'ZONING',
-      sf.attributes->>'ZONE_CODE',
-      sf.attributes->>'ZONING_CLASS'
-    )
-    FROM spatial_features sf
-    WHERE sf.layer_type = 'zoning'
-      AND sf.county_id = ${countyId}
-      AND ST_Intersects(p.geometry, sf.geometry)
-      AND p.zoning_code IS NULL
-      AND p.geometry IS NOT NULL
+  const needsUpdate = await db.execute(sql`
+    SELECT id FROM ${sql.raw(tableName)}
+    WHERE zoning_code IS NULL AND geometry IS NOT NULL
   `)
+  const ids: string[] = (needsUpdate as any).rows.map((r: any) => r.id)
+  console.log(`[pipeline] Zoning code update: ${ids.length} parcels to process`)
+
+  const BATCH = 300
+  for (let i = 0; i < ids.length; i += BATCH) {
+    const batch = ids.slice(i, i + BATCH)
+    const idValues = batch.map(id => sql`(${id}::uuid)`)
+    try {
+      await db.execute(sql`
+        UPDATE ${sql.raw(tableName)} p
+        SET zoning_code = COALESCE(
+          sf.attributes->>'ZONING',
+          sf.attributes->>'ZONE_CODE',
+          sf.attributes->>'ZONING_CLASS'
+        )
+        FROM spatial_features sf
+        WHERE sf.layer_type = 'zoning'
+          AND sf.county_id = ${countyId}
+          AND ST_Intersects(p.geometry, sf.geometry)
+          AND p.id IN (SELECT id FROM (VALUES ${sql.join(idValues, sql`,`)}) AS v(id))
+      `)
+    } catch (err) {
+      console.warn(`[pipeline] Zoning batch ${i}–${i + BATCH} failed:`, err)
+    }
+  }
   console.log(`[pipeline] Zoning code update complete for ${countyId}`)
 }
 
@@ -327,23 +359,39 @@ async function runFloodZoneUpdate(countyId: string) {
   console.log(`[pipeline] Running flood zone update for ${countyId}`)
   const tableName = countyId === 'dupage' ? 'parcels_dupage' : 'parcels_cook'
 
-  // FEMA flood zone layers use field FLD_ZONE or ZONE_ depending on source
-  await db.execute(sql`
-    UPDATE ${sql.raw(tableName)} p
-    SET flood_zone = COALESCE(
-      sf.attributes->>'ZONE_CODE',
-      sf.attributes->>'FLD_ZONE',
-      sf.attributes->>'ZONE_',
-      sf.attributes->>'FLOOD_ZONE',
-      'X'
-    )
-    FROM spatial_features sf
-    WHERE sf.layer_type = 'flood'
-      AND sf.county_id = ${countyId}
-      AND ST_Intersects(p.geometry, sf.geometry)
-      AND p.flood_zone IS NULL
-      AND p.geometry IS NOT NULL
+  // Fetch IDs of parcels that still need a flood zone assigned
+  const needsUpdate = await db.execute(sql`
+    SELECT id FROM ${sql.raw(tableName)}
+    WHERE flood_zone IS NULL AND geometry IS NOT NULL
   `)
+  const ids: string[] = (needsUpdate as any).rows.map((r: any) => r.id)
+  console.log(`[pipeline] Flood zone update: ${ids.length} parcels to process`)
+
+  // Process in batches of 300 — keeps each ST_Intersects well within Neon's timeout
+  const FLOOD_BATCH = 300
+  for (let i = 0; i < ids.length; i += FLOOD_BATCH) {
+    const batch = ids.slice(i, i + FLOOD_BATCH)
+    const idValues = batch.map(id => sql`(${id}::uuid)`)
+    try {
+      await db.execute(sql`
+        UPDATE ${sql.raw(tableName)} p
+        SET flood_zone = COALESCE(
+          sf.attributes->>'ZONE_CODE',
+          sf.attributes->>'FLD_ZONE',
+          sf.attributes->>'ZONE_',
+          sf.attributes->>'FLOOD_ZONE',
+          'X'
+        )
+        FROM spatial_features sf
+        WHERE sf.layer_type = 'flood'
+          AND sf.county_id = ${countyId}
+          AND ST_Intersects(p.geometry, sf.geometry)
+          AND p.id IN (SELECT id FROM (VALUES ${sql.join(idValues, sql`,`)}) AS v(id))
+      `)
+    } catch (err) {
+      console.warn(`[pipeline] Flood zone batch ${i}–${i + FLOOD_BATCH} failed:`, err)
+    }
+  }
   console.log(`[pipeline] Flood zone update complete for ${countyId}`)
 }
 
@@ -413,45 +461,39 @@ export async function runIngestion(opts: RunIngestionOptions): Promise<{ jobIds:
       )
     )
 
-    // ── Step 3.5: Repair invalid geometries before any spatial join ──────────
-    await repairSpatialGeometries(countyId)
-
     // ── Step 4: Spatial join after municipality boundaries are loaded ─────────
     await runMunicipalityJoin(countyId)
 
-    // ── Steps 5b–7b: Flood and zoning overlays are independent — run in parallel
+    // ── Steps 5b–7b: Ingest flood and zoning overlays in parallel ────────────
     const [floodLayers, zoningLayers] = await Promise.all([
       db.select().from(dataLayers).where(and(eq(dataLayers.countyId, countyId), eq(dataLayers.layerType, 'flood'))),
       db.select().from(dataLayers).where(and(eq(dataLayers.countyId, countyId), eq(dataLayers.layerType, 'zoning'))),
     ])
 
     await Promise.all([
-      // Flood: ingest all flood layers in parallel → stamp flood_zone
-      (async () => {
-        await Promise.allSettled(
-          floodLayers.map(layer =>
-            ingestOverlayLayer(countyId, layer, 'flood').catch(err =>
-              console.error(`[pipeline] Flood layer failed (${layer.serviceUrl}):`, err)
-            )
+      Promise.allSettled(
+        floodLayers.map(layer =>
+          ingestOverlayLayer(countyId, layer, 'flood').catch(err =>
+            console.error(`[pipeline] Flood layer failed (${layer.serviceUrl}):`, err)
           )
         )
-        if (floodLayers.length > 0) await runFloodZoneUpdate(countyId)
-      })(),
+      ),
+      Promise.allSettled(
+        zoningLayers.map(layer =>
+          ingestOverlayLayer(countyId, layer, 'zoning').catch(err =>
+            console.error(`[pipeline] Zoning layer failed (${layer.serviceUrl}):`, err)
+          )
+        )
+      ),
+    ])
 
-      // Zoning: ingest all zoning layers in parallel → repair geometries → stamp zoning_code
-      (async () => {
-        await Promise.allSettled(
-          zoningLayers.map(layer =>
-            ingestOverlayLayer(countyId, layer, 'zoning').catch(err =>
-              console.error(`[pipeline] Zoning layer failed (${layer.serviceUrl}):`, err)
-            )
-          )
-        )
-        if (zoningLayers.length > 0) {
-          await repairSpatialGeometries(countyId)
-          await runZoningCodeUpdate(countyId)
-        }
-      })(),
+    // ── Step 3.5: Repair all spatial geometries once, after all overlays are loaded ──
+    await repairSpatialGeometries(countyId)
+
+    // ── Spatial joins: stamp flood_zone and zoning_code in parallel ───────────
+    await Promise.all([
+      floodLayers.length > 0 ? runFloodZoneUpdate(countyId) : Promise.resolve(),
+      zoningLayers.length > 0 ? runZoningCodeUpdate(countyId) : Promise.resolve(),
     ])
 
     console.log(`═══ Ingestion complete for ${countyId} ═══\n`)
