@@ -2,6 +2,8 @@
   "name": "nura",
   "scripts": {
     "dev": "bun run --hot src/index.ts",
+    "worker:pipeline": "bun run src/workers/pipeline.worker.ts",
+    "worker:municipal": "bun run src/workers/municipal.worker.ts",
     "db:generate": "bunx drizzle-kit generate",
     "db:migrate": "bun run src/db/migrate.ts",
     "db:seed": "bun run src/db/seed.ts"
@@ -10,8 +12,10 @@
     "@mendable/firecrawl-js": "^4.16.0",
     "@neondatabase/serverless": "^1.0.2",
     "@pinecone-database/pinecone": "^7.1.0",
+    "bullmq": "^5.71.0",
     "drizzle-orm": "^0.45.1",
     "hono": "^4.12.8",
+    "ioredis": "^5.10.0",
     "openai": "^6.29.0",
     "pdf-parse": "1.1.1",
     "playwright": "^1.58.2"

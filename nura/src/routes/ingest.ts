@@ -2,8 +2,7 @@ import { Hono } from 'hono'
 import { eq, and } from 'drizzle-orm'
 import { db } from '../db/client'
 import { ingestionJobs, dataLayers, municipalities } from '../db/schema'
-import { runIngestion } from '../ingestion/pipeline'
-import { runMunicipalIngestion } from '../ingestion/municipal/pipeline'
+import { pipelineQueue, municipalQueue } from '../queue/queues'
 
 const ingest = new Hono()
 
@@ -24,12 +23,9 @@ ingest.post('/trigger', async (c) => {
     return c.json({ error: 'type must be "full" or "delta"' }, 400)
   }
 
-  // Fire and forget — client polls /ingest/status for progress
-  runIngestion({ countyId: county, jobType: type }).catch(err => {
-    console.error('[ingest/trigger] pipeline error:', err)
-  })
+  const job = await pipelineQueue.add('run-pipeline', { countyId: county, jobType: type })
 
-  return c.json({ message: 'Ingestion started', county, type }, 202)
+  return c.json({ message: 'Ingestion queued', county, type, jobId: job.id, status: 'queued' }, 202)
 })
 
 // GET /ingest/status
@@ -97,14 +93,35 @@ ingest.post('/municipal', async (c) => {
     targets = [municipalityParam]
   }
 
-  // Fire and forget — each runs async
-  for (const municipalityId of targets) {
-    runMunicipalIngestion(municipalityId).catch(err => {
-      console.error(`[ingest/municipal] ${municipalityId} failed:`, err)
-    })
-  }
+  const jobs = await Promise.all(
+    targets.map(municipalityId =>
+      municipalQueue.add('run-municipal', { municipalityId })
+    )
+  )
 
-  return c.json({ message: 'Municipal ingestion started', municipalities: targets }, 202)
+  return c.json({
+    message: 'Municipal ingestion queued',
+    municipalities: targets,
+    jobIds: jobs.map(j => j.id),
+    status: 'queued',
+  }, 202)
+})
+
+// GET /ingest/jobs/:jobId
+// Check BullMQ job state: waiting | active | completed | failed | delayed
+ingest.get('/jobs/:jobId', async (c) => {
+  const jobId = c.req.param('jobId')
+
+  // Check both queues
+  let job = await pipelineQueue.getJob(jobId)
+  if (!job) job = await municipalQueue.getJob(jobId)
+  if (!job) return c.json({ error: 'job not found' }, 404)
+
+  const state  = await job.getState()
+  const result = job.returnvalue ?? null
+  const error  = job.failedReason ?? null
+
+  return c.json({ jobId: job.id, state, result, error, data: job.data })
 })
 
 export default ingest
