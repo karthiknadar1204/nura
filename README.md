@@ -939,3 +939,28 @@ PINECONE_INDEX_NAME=nura
 REDIS_URL=redis://localhost:6379
 FIRECRAWL_API_KEY=fc-...
 ```
+
+---
+
+## Known Issues
+
+### Spatial join topology errors during ingestion
+
+During ingestion, the final spatial join steps (`runFloodZoneUpdate`, `runZoningCodeUpdate`) may throw a PostGIS error:
+
+```
+GEOSIntersects: TopologyException: side location conflict at <coordinate>
+```
+
+This happens because some flood zone and zoning polygons fetched from the ArcGIS REST API have geometry topology defects that cause GEOS to fail at intersection time. The pipeline attempts to pre-repair all geometries via `ST_Buffer(ST_MakeValid(geometry), 0)` in `repairSpatialGeometries` before the joins run, but the error can still appear in certain cases.
+
+**Workaround:** Run the repair query directly in your SQL editor after ingestion completes:
+
+```sql
+UPDATE spatial_features
+SET geometry = ST_Buffer(ST_MakeValid(geometry), 0)
+WHERE county_id = 'dupage'
+  AND geometry IS NOT NULL;
+```
+
+Then re-run the spatial join queries manually or trigger a new ingestion. The repair query succeeds when run directly — the issue appears to be specific to the execution context inside the BullMQ worker pipeline.
