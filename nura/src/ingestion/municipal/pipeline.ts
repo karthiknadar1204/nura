@@ -4,9 +4,7 @@
 import { eq } from 'drizzle-orm'
 import { db } from '../../db/client'
 import { municipalities, ingestionJobs } from '../../db/schema'
-import { PdfDirectAdapter } from './adapters/pdf'
 import { MunicodeAdapter } from './adapters/municode'
-import { AMLegalAdapter } from './adapters/amlegal'
 import type { ZoningAdapter } from './adapters/interface'
 import { storeChunks, storeStructuredData, extractStructuredData } from './parser'
 
@@ -18,10 +16,8 @@ function sleep(ms: number) {
 
 function getAdapter(zoningSource: string): ZoningAdapter {
   switch (zoningSource) {
-    case 'pdf_direct': return new PdfDirectAdapter()
-    case 'municode':   return new MunicodeAdapter()
-    case 'amlegal':    return new AmlegalAdapter()
-    default:           throw new Error(`No adapter for zoning source: ${zoningSource}`)
+    case 'municode': return new MunicodeAdapter()
+    default:         throw new Error(`No adapter for zoning source: ${zoningSource}`)
   }
 }
 
@@ -29,7 +25,6 @@ export async function runMunicipalIngestion(municipalityId: string): Promise<voi
   const [muni] = await db.select().from(municipalities).where(eq(municipalities.id, municipalityId))
   if (!muni) throw new Error(`Municipality not found: ${municipalityId}`)
   if (!muni.zoningSource) throw new Error(`No zoning source configured for ${municipalityId}`)
-  if (!muni.zoningUrl)    throw new Error(`No zoning URL configured for ${municipalityId}`)
 
   console.log(`\n[municipal] Starting ingestion for ${muni.name} (${muni.zoningSource})`)
 
@@ -99,8 +94,16 @@ export async function runMunicipalIngestion(municipalityId: string): Promise<voi
       completedAt:      new Date(),
     }).where(eq(ingestionJobs.id, job.id))
 
+    // Close browser if adapter holds one (Playwright-based adapters)
+    if (typeof (adapter as any).close === 'function') {
+      await (adapter as any).close()
+    }
+
     console.log(`[municipal:${municipalityId}] Done. processed=${processed} failed=${failed}`)
   } catch (err) {
+    if (typeof (adapter as any).close === 'function') {
+      await (adapter as any).close().catch(() => {})
+    }
     await db.update(ingestionJobs).set({
       status:      'failed',
       errorLog:    { message: String(err) },

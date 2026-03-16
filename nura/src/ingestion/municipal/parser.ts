@@ -6,7 +6,7 @@
 
 import { randomUUID } from 'crypto'
 import OpenAI from 'openai'
-import { sql } from 'drizzle-orm'
+import { eq, and, sql } from 'drizzle-orm'
 import { db } from '../../db/client'
 import {
   zoningDistricts,
@@ -66,19 +66,27 @@ interface ExtractionResult {
 const EXTRACTION_SYSTEM = `You are a zoning ordinance data extraction assistant.
 Given the text of a zoning ordinance chapter, extract structured information as JSON.
 
-Return an object with these keys:
-- "districts": array of zoning districts defined in this chapter
-- "permitted_uses": array of permitted, conditional, or prohibited uses per district
-- "development_standards": array of dimensional/development standards per district
+Return an object with exactly these keys:
+- "districts": array of zoning district objects
+- "permitted_uses": array of permitted/conditional/prohibited use objects
+- "development_standards": array of dimensional standard objects
 
-For development_standards, use these standard_type values:
-  min_lot_sqft, min_lot_width_ft, front_setback_ft, rear_setback_ft,
-  side_setback_ft, max_height_ft, max_lot_coverage_pct, floor_area_ratio,
-  max_density, min_unit_size_sqft
+Each district object MUST have these exact fields (never omit "code"):
+  { "code": "R-1", "name": "Single Family Residential District", "category": "residential", "description": "..." }
+  "code" is the short abbreviation (e.g. R-1, B-2, M-1, R1A). Do not use the full name as the code.
 
-For district category use one of: residential, commercial, industrial, mixed, overlay, special, institutional
+Each permitted_use object MUST have:
+  { "district_code": "R-1", "use_description": "...", "permit_type": "by_right", "use_category": "residential", "conditions": null }
+  permit_type must be one of: by_right, conditional, prohibited, accessory
 
-If the chapter does not define any specific districts (e.g. Table of Contents, Definitions),
+Each development_standard object MUST have:
+  { "district_code": "R-1", "standard_type": "min_lot_sqft", "value": 8000, "unit": "sqft", "conditions": null }
+  standard_type must be one of: min_lot_sqft, min_lot_width_ft, front_setback_ft, rear_setback_ft,
+  side_setback_ft, max_height_ft, max_lot_coverage_pct, floor_area_ratio, max_density, min_unit_size_sqft
+
+For district category use only: residential, commercial, industrial, mixed, overlay, special, institutional
+
+If the chapter does not define specific districts (e.g. Table of Contents, Definitions, Administration),
 return empty arrays. Extract only what is actually present — do not hallucinate values.`
 
 export async function extractStructuredData(
@@ -148,34 +156,45 @@ export async function storeStructuredData(
   municipalityId: string,
   extracted:      ExtractionResult,
 ): Promise<void> {
-  // Upsert each district
-  for (const d of extracted.districts) {
+  // Upsert each district using ORM
+  for (const raw of extracted.districts) {
+    // Normalize: LLM sometimes returns a plain string or omits "code"
+    const d: ExtractedDistrict = typeof raw === 'string'
+      ? { code: raw.split(/\s+/)[0], name: raw, category: 'residential', description: '' }
+      : { ...raw, code: raw.code ?? (raw as any).district_code ?? (raw as any).name?.split(/\s+/)[0] }
+
     if (!d.code) continue
 
-    await db.execute(sql`
-      INSERT INTO zoning_districts (id, municipality_id, district_code, district_name, category, description)
-      VALUES (gen_random_uuid(), ${municipalityId}, ${d.code}, ${d.name ?? null}, ${d.category ?? null}, ${d.description ?? null})
-      ON CONFLICT (municipality_id, district_code) DO UPDATE SET
-        district_name = EXCLUDED.district_name,
-        category      = EXCLUDED.category,
-        description   = EXCLUDED.description
-    `)
+    try {
+      const result = await db.insert(zoningDistricts).values({
+        municipalityId,
+        districtCode: d.code,
+        districtName: d.name        ?? null,
+        category:     d.category    ?? null,
+        description:  d.description ?? null,
+      }).onConflictDoNothing().returning({ id: zoningDistricts.id })
+      console.log(`[parser] district ${d.code} → ${result.length > 0 ? 'inserted id=' + result[0].id : 'conflict/skipped'}`)
+    } catch (err) {
+      console.error(`[parser] district insert error (${d.code}):`, err)
+    }
   }
 
   // For uses and standards, look up the district row ID by code
   for (const use of extracted.permitted_uses) {
     if (!use.district_code || !use.use_description) continue
 
-    const rows = await db.execute(sql`
-      SELECT id FROM zoning_districts
-      WHERE municipality_id = ${municipalityId} AND district_code = ${use.district_code}
-      LIMIT 1
-    `)
-    if (rows.rows.length === 0) continue
-    const districtId = (rows.rows[0] as any).id
+    const [district] = await db
+      .select({ id: zoningDistricts.id })
+      .from(zoningDistricts)
+      .where(and(
+        eq(zoningDistricts.municipalityId, municipalityId),
+        eq(zoningDistricts.districtCode, use.district_code),
+      ))
+      .limit(1)
+    if (!district) continue
 
     await db.insert(permittedUses).values({
-      districtId,
+      districtId:     district.id,
       useCategory:    use.use_category   ?? null,
       useDescription: use.use_description,
       permitType:     use.permit_type    ?? 'by_right',
@@ -186,16 +205,18 @@ export async function storeStructuredData(
   for (const std of extracted.development_standards) {
     if (!std.district_code || !std.standard_type) continue
 
-    const rows = await db.execute(sql`
-      SELECT id FROM zoning_districts
-      WHERE municipality_id = ${municipalityId} AND district_code = ${std.district_code}
-      LIMIT 1
-    `)
-    if (rows.rows.length === 0) continue
-    const districtId = (rows.rows[0] as any).id
+    const [district] = await db
+      .select({ id: zoningDistricts.id })
+      .from(zoningDistricts)
+      .where(and(
+        eq(zoningDistricts.municipalityId, municipalityId),
+        eq(zoningDistricts.districtCode, std.district_code),
+      ))
+      .limit(1)
+    if (!district) continue
 
     await db.insert(developmentStandards).values({
-      districtId,
+      districtId:   district.id,
       standardType: std.standard_type,
       value:        std.value != null ? String(std.value) : null,
       unit:         std.unit         ?? null,

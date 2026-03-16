@@ -7,11 +7,13 @@
     "db:seed": "bun run src/db/seed.ts"
   },
   "dependencies": {
+    "@mendable/firecrawl-js": "^4.16.0",
     "@neondatabase/serverless": "^1.0.2",
     "drizzle-orm": "^0.45.1",
     "hono": "^4.12.8",
     "openai": "^6.29.0",
-    "pdf-parse": "1.1.1"
+    "pdf-parse": "1.1.1",
+    "playwright": "^1.58.2"
   },
   "devDependencies": {
     "@types/bun": "latest",
