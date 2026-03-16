@@ -132,6 +132,75 @@ https://gis.dupageco.org/arcgis/rest/services/Accela/AccelaServiceParcelsWGS84/M
 (337,690 records — but we cap at 4,000 for the current ingestion limit)
 ```
 
+#### DuPage source URLs
+
+To inspect the actual field names of any layer, append `?f=json` to the layer URL — it returns the full `fields` array with every attribute name, which is exactly how `DUPAGE_FIELD_MAPPING` was constructed.
+
+**Core infrastructure**
+| Purpose | URL |
+|---|---|
+| ArcGIS REST root (layer walk entry point) | `https://gis.dupageco.org/arcgis/rest/services` |
+| Open data portal | `https://gisdata-dupage.opendata.arcgis.com` |
+| DCAT open data catalog feed | `https://gisdata-dupage.opendata.arcgis.com/api/feed/dcat-us/1.1.json` |
+
+**Parcel layers**
+| Purpose | URL |
+|---|---|
+| Authoritative parcel layer — WGS84 (337,690 records, used by pipeline) | `https://gis.dupageco.org/arcgis/rest/services/Accela/AccelaServiceParcelsWGS84/MapServer/0` |
+| Parcel layer with real estate attributes | `https://gis.dupageco.org/arcgis/rest/services/DuPage_County_IL/ParcelsWithRealEstateCC/FeatureServer/0` |
+| Alternative parcel map server | `https://gis.dupageco.org/arcgis/rest/services/Parcel/MapServer/0` |
+| Assessment parcel viewer | `https://gis.dupageco.org/arcgis/rest/services/ParcelSearch/DuPageAssessmentParcelViewer/MapServer` |
+| Assessment parcel search | `https://gis.dupageco.org/arcgis/rest/services/ParcelSearch/DuPageAssessmentParcelSearch/MapServer/0` |
+
+**Zoning**
+| Purpose | URL |
+|---|---|
+| Unincorporated zoning polygons (used by pipeline) | `https://gis.dupageco.org/arcgis/rest/services/Zoning/UnincorporatedZoningData/MapServer/0` |
+
+**Flood zones / stormwater**
+| Purpose | URL |
+|---|---|
+| Flood zones regulatory floodplain | `https://gis.dupageco.org/arcgis/rest/services/Stormwater/Flood_Zones_RFM/MapServer` |
+| Special flood hazard areas | `https://gis.dupageco.org/arcgis/rest/services/Stormwater/SpecialFloodHazardAreasDuPage/MapServer` |
+| RFM flood zones (used by pipeline) | `https://gis.dupageco.org/arcgis/rest/services/Stormwater/DuPage_RFM_Flood_Zones/MapServer/0` |
+
+**Municipality & boundaries**
+| Purpose | URL |
+|---|---|
+| Municipality boundary polygons (used by pipeline) | `https://gis.dupageco.org/arcgis/rest/services/DuPage_County_IL/Municipality/MapServer` |
+
+**Schools**
+| Purpose | URL |
+|---|---|
+| Grade school district boundaries | `https://gis.dupageco.org/arcgis/rest/services/DuPage_County_IL/Grade_School_Districts/MapServer` |
+| High school district boundaries | `https://gis.dupageco.org/arcgis/rest/services/DuPage_County_IL/High_School_Districts/MapServer` |
+| School locations | `https://gis.dupageco.org/arcgis/rest/services/DuPage_County_IL/Schools/MapServer` |
+
+**Environment & natural resources**
+| Purpose | URL |
+|---|---|
+| SSURGO soils | `https://gis.dupageco.org/arcgis/rest/services/Environmental/DuPage_SSURGO_Soils_2024/MapServer` |
+| Hydric soils | `https://gis.dupageco.org/arcgis/rest/services/Environmental/HydricSoils2024/MapServer` |
+| Wetlands inventory | `https://gis.dupageco.org/arcgis/rest/services/NaturalAreas/Wetlands_Inventory/MapServer` |
+| Lakes and ponds | `https://gis.dupageco.org/arcgis/rest/services/Hydrography/DPMS_LakesPonds_Service/FeatureServer/0` |
+
+**Transportation**
+| Purpose | URL |
+|---|---|
+| Road centerlines | `https://gis.dupageco.org/arcgis/rest/services/Transportation/Road_Centerlines/MapServer` |
+
+---
+
+For Cook County, the equivalent URLs are:
+| Purpose | URL |
+|---|---|
+| ArcGIS / Open Data Hub | `https://hub-cookcountyil.opendata.arcgis.com` |
+| DCAT feed | `https://hub-cookcountyil.opendata.arcgis.com/api/feed/dcat-us/1.1.json` |
+
+Note: Cook's primary ArcGIS server (`gis12.cookcountyil.gov`) times out — the open data hub is used as the fallback.
+
+---
+
 #### How `paginateLayer()` works
 
 ArcGIS REST services have a `maxRecordCount` limit — you can only fetch 1,000 features per request. To get all features, you paginate using `resultOffset`:
