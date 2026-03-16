@@ -1,8 +1,9 @@
 import { Hono } from 'hono'
 import { eq, and } from 'drizzle-orm'
 import { db } from '../db/client'
-import { ingestionJobs, dataLayers } from '../db/schema'
+import { ingestionJobs, dataLayers, municipalities } from '../db/schema'
 import { runIngestion } from '../ingestion/pipeline'
+import { runMunicipalIngestion } from '../ingestion/municipal/pipeline'
 
 const ingest = new Hono()
 
@@ -73,6 +74,37 @@ ingest.get('/layers', async (c) => {
     )
     .limit(200)
   return c.json(layers)
+})
+
+// POST /ingest/municipal
+// Body: { municipality: 'wheaton' | 'naperville' | 'chicago' | 'evanston' | 'all' }
+// Triggers zoning ordinance scraping and structured data extraction for the municipality.
+ingest.post('/municipal', async (c) => {
+  const body = await c.req.json().catch(() => null)
+  const municipalityParam: string | undefined = body?.municipality
+
+  if (!municipalityParam) {
+    return c.json({ error: 'municipality is required' }, 400)
+  }
+
+  // Resolve which municipalities to run
+  let targets: string[]
+  if (municipalityParam === 'all') {
+    const all = await db.select({ id: municipalities.id, zoningSource: municipalities.zoningSource })
+      .from(municipalities)
+    targets = all.filter(m => m.zoningSource).map(m => m.id)
+  } else {
+    targets = [municipalityParam]
+  }
+
+  // Fire and forget — each runs async
+  for (const municipalityId of targets) {
+    runMunicipalIngestion(municipalityId).catch(err => {
+      console.error(`[ingest/municipal] ${municipalityId} failed:`, err)
+    })
+  }
+
+  return c.json({ message: 'Municipal ingestion started', municipalities: targets }, 202)
 })
 
 export default ingest
