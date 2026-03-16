@@ -372,6 +372,11 @@ async function runFloodZoneUpdate(countyId: string) {
   for (let i = 0; i < ids.length; i += FLOOD_BATCH) {
     const batch = ids.slice(i, i + FLOOD_BATCH)
     const idValues = batch.map(id => sql`(${id}::uuid)`)
+
+    // UPDATE spatial_features                                                                                                                                         
+    // SET geometry = ST_Buffer(ST_MakeValid(geometry), 0)                                                                                                               
+    // WHERE county_id = 'dupage'                                                                                                                                      
+    //   AND geometry IS NOT NULL; 
     try {
       await db.execute(sql`
         UPDATE ${sql.raw(tableName)} p
