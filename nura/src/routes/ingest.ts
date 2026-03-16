@@ -8,8 +8,6 @@ const ingest = new Hono()
 
 // POST /ingest/trigger
 // Body: { county: 'cook' | 'dupage' | 'all', type: 'full' | 'delta' }
-// Kicks off the full ingestion pipeline for the given county.
-// Runs async — returns immediately with a 202 and the job tracking info.
 ingest.post('/trigger', async (c) => {
   const body = await c.req.json().catch(() => null)
 
@@ -74,7 +72,6 @@ ingest.get('/layers', async (c) => {
 
 // POST /ingest/municipal
 // Body: { municipality: 'wheaton' | 'naperville' | 'chicago' | 'evanston' | 'all' }
-// Triggers zoning ordinance scraping and structured data extraction for the municipality.
 ingest.post('/municipal', async (c) => {
   const body = await c.req.json().catch(() => null)
   const municipalityParam: string | undefined = body?.municipality
@@ -83,7 +80,6 @@ ingest.post('/municipal', async (c) => {
     return c.json({ error: 'municipality is required' }, 400)
   }
 
-  // Resolve which municipalities to run
   let targets: string[]
   if (municipalityParam === 'all') {
     const all = await db.select({ id: municipalities.id, zoningSource: municipalities.zoningSource })
@@ -107,12 +103,10 @@ ingest.post('/municipal', async (c) => {
   }, 202)
 })
 
-// GET /ingest/jobs/:jobId
-// Check BullMQ job state: waiting | active | completed | failed | delayed
+// GET /ingest/jobs/:jobId — check BullMQ job state
 ingest.get('/jobs/:jobId', async (c) => {
   const jobId = c.req.param('jobId')
 
-  // Check both queues
   let job = await pipelineQueue.getJob(jobId)
   if (!job) job = await municipalQueue.getJob(jobId)
   if (!job) return c.json({ error: 'job not found' }, 404)
