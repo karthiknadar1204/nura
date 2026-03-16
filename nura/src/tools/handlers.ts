@@ -1,7 +1,7 @@
 // Tool handlers — execute the actual DB queries for each tool call.
 // All functions return plain JS objects that get serialised as tool results.
 
-import { eq, and, or, ilike, gte, lte, inArray, isNotNull, sql } from 'drizzle-orm'
+import { eq, and, or, ilike, gte, lte, inArray, isNotNull, sql, asc, desc } from 'drizzle-orm'
 import { db } from '../db/client'
 import {
   parcelsDupage,
@@ -31,6 +31,8 @@ export async function searchParcels(args: {
   max_building_sqft?:  number
   min_year_built?:     number
   max_year_built?:     number
+  sort_by?:           string
+  sort_order?:        string
   limit?:             number
 }) {
   const {
@@ -39,6 +41,7 @@ export async function searchParcels(args: {
     min_lot_sqft, max_lot_sqft,
     min_building_sqft, max_building_sqft,
     min_year_built, max_year_built,
+    sort_by, sort_order = 'desc',
     limit = 20,
   } = args
 
@@ -64,6 +67,19 @@ export async function searchParcels(args: {
     .from(parcelsDupage)
     .where(whereClause)
 
+  const sortableColumns: Record<string, any> = {
+    assessed_value: parcelsDupage.assessedValue,
+    lot_area_sqft:  parcelsDupage.lotAreaSqft,
+    building_sqft:  parcelsDupage.buildingSqft,
+    year_built:     parcelsDupage.yearBuilt,
+  }
+  const sortCol = sort_by && sortableColumns[sort_by] ? sortableColumns[sort_by] : null
+  const orderExpr = sortCol
+    ? (sort_order === 'asc'
+        ? sql`${sortCol}::numeric ASC NULLS LAST`
+        : sql`${sortCol}::numeric DESC NULLS LAST`)
+    : undefined
+
   const rows = await db
     .select({
       pin:            parcelsDupage.pin,
@@ -80,6 +96,7 @@ export async function searchParcels(args: {
     })
     .from(parcelsDupage)
     .where(whereClause)
+    .orderBy(...(orderExpr ? [orderExpr] : [sql`1`]))
     .limit(limit)
 
   return {

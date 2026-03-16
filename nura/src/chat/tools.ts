@@ -26,6 +26,8 @@ export const toolDefinitions = [
           max_building_sqft:  { type: 'number', description: 'Maximum building square footage' },
           min_year_built:     { type: 'number', description: 'Minimum year the structure was built' },
           max_year_built:     { type: 'number', description: 'Maximum year the structure was built' },
+          sort_by:      { type: 'string', enum: ['assessed_value', 'lot_area_sqft', 'building_sqft', 'year_built'], description: 'Sort results by this column. Use for "highest/lowest/most/least" queries.' },
+          sort_order:   { type: 'string', enum: ['asc', 'desc'], description: 'Sort direction: desc (default) or asc' },
           limit:        { type: 'number', description: 'Max results to return (default 20)' },
         },
       },

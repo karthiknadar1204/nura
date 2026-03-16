@@ -127,6 +127,8 @@ export const parcelsDupage = pgTable(
     index('idx_parcels_dupage_values').on(t.assessedValue, t.lotAreaSqft),
     // Composite: most common multi-filter pattern
     index('idx_parcels_dupage_composite').on(t.municipalityId, t.zoningCode, t.ownershipType),
+    // GiST index for spatial joins (ST_Intersects, ST_DWithin)
+    index('idx_parcels_dupage_geometry').using('gist', t.geometry),
   ]
 )
 
@@ -197,6 +199,8 @@ export const spatialFeatures = pgTable(
   (t) => [
     index('idx_spatial_county_type').on(t.countyId, t.layerType),
     uniqueIndex('uq_spatial_layer_feature').on(t.layerId, t.featureId),
+    // GiST index for spatial joins (ST_Intersects)
+    index('idx_spatial_features_geometry').using('gist', t.geometry),
   ]
 )
 

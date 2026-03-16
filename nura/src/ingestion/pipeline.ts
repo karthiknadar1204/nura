@@ -8,7 +8,7 @@ import {
   parcelsCook,
 } from '../db/schema'
 import { discoverLayers } from './arcgis/discover'
-import { paginateLayer } from './arcgis/paginate'
+import { paginateLayer, fetchAllFeaturesParallel } from './arcgis/paginate'
 import { normalizeFeature, DUPAGE_FIELD_MAPPING, COOK_FIELD_MAPPING, type FieldMapping } from './arcgis/normalize'
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -76,19 +76,29 @@ async function updateGeometriesForBatch(
   geomMap: Map<string, string>,  // pin → GeoJSON string
 ) {
   const tableName = countyId === 'dupage' ? 'parcels_dupage' : 'parcels_cook'
-  for (const [pin, geojson] of Array.from(geomMap)) {
+  const entries = Array.from(geomMap.entries())
+
+  // Batch via VALUES clause — one query per 500 rows instead of one query per row
+  for (let i = 0; i < entries.length; i += INSERT_BATCH) {
+    const slice = entries.slice(i, i + INSERT_BATCH)
+    const valueParts = slice.map(([pin, geojson]) => sql`(${pin}, ${geojson})`)
     try {
-      await db.execute(
-        sql`UPDATE ${sql.raw(tableName)} SET geometry = ST_GeomFromGeoJSON(${geojson}) WHERE pin = ${pin} AND geometry IS NULL`
-      )
-    } catch { /* skip invalid geometries */ }
+      await db.execute(sql`
+        UPDATE ${sql.raw(tableName)} t
+        SET geometry = ST_GeomFromGeoJSON(v.geojson)
+        FROM (VALUES ${sql.join(valueParts, sql`, `)}) AS v(pin, geojson)
+        WHERE t.pin = v.pin
+      `)
+    } catch (err) {
+      console.warn(`[geometry] batch update failed, skipping ${slice.length} rows:`, err)
+    }
   }
 }
 
 // Overloaded ingest that also collects geometry and updates in a second pass
 async function ingestParcelLayerWithGeometry(
   countyId: 'dupage' | 'cook',
-  layer: { id: string; serviceUrl: string; fieldMapping: any },
+  layer: { id: string; serviceUrl: string; fieldMapping: any; recordCount?: number | null },
   jobType: 'full' | 'delta',
 ) {
   // Always use the canonical mapping from normalize.ts — the DB copy may be stale
@@ -100,81 +110,84 @@ async function ingestParcelLayerWithGeometry(
   let failed    = 0
 
   try {
-    for await (const batch of paginateLayer(layer.serviceUrl, {
+    console.log(`[ingest:${countyId}] Fetching features in parallel pages…`)
+    const allFeatures = await fetchAllFeaturesParallel(layer.serviceUrl, {
       onProgress: n => console.log(`[ingest:${countyId}] ${n} features fetched`),
-      maxRecords: 4000,
-    })) {
-      const rows: any[]             = []
-      const geomMap = new Map<string, string>()
+      maxRecords: 10_000,
+      knownCount: layer.recordCount ?? undefined,
+    })
+    console.log(`[ingest:${countyId}] Fetch complete — ${allFeatures.length} features`)
 
-      for (const feature of batch) {
-        const norm = normalizeFeature(feature.attributes, feature.geometry, fieldMapping)
-        if (!norm) { failed++; continue }
+    const rows: any[]            = []
+    const geomMap = new Map<string, string>()
 
-        rows.push({
-          pin:              norm.pin,
-          address:          norm.address,
-          ownerName:        norm.ownerName,
-          ownerAddress:     norm.ownerAddress,
-          legalDescription: norm.legalDescription,
-          landUseCode:      norm.landUseCode,
-          zoningCode:       norm.zoningCode,
-          assessedValue:    norm.assessedValue,
-          landValue:        norm.landValue,
-          buildingValue:    norm.buildingValue,
-          lotAreaSqft:      norm.lotAreaSqft,
-          buildingSqft:     norm.buildingSqft,
-          yearBuilt:        norm.yearBuilt,
-          ownershipType:    norm.ownershipType,
-          rawAttributes:    norm.rawAttributes,
-          dataHash:         norm.dataHash,
-          lastUpdatedAt:    new Date(),
-        })
+    for (const feature of allFeatures) {
+      const norm = normalizeFeature(feature.attributes, feature.geometry, fieldMapping)
+      if (!norm) { failed++; continue }
 
-        if (norm.geometryGeoJson) geomMap.set(norm.pin, norm.geometryGeoJson)
-      }
+      rows.push({
+        pin:              norm.pin,
+        address:          norm.address,
+        ownerName:        norm.ownerName,
+        ownerAddress:     norm.ownerAddress,
+        legalDescription: norm.legalDescription,
+        landUseCode:      norm.landUseCode,
+        zoningCode:       norm.zoningCode,
+        assessedValue:    norm.assessedValue,
+        landValue:        norm.landValue,
+        buildingValue:    norm.buildingValue,
+        lotAreaSqft:      norm.lotAreaSqft,
+        buildingSqft:     norm.buildingSqft,
+        yearBuilt:        norm.yearBuilt,
+        ownershipType:    norm.ownershipType,
+        rawAttributes:    norm.rawAttributes,
+        dataHash:         norm.dataHash,
+        lastUpdatedAt:    new Date(),
+      })
 
-      // Deduplicate by PIN within the batch — Postgres rejects ON CONFLICT DO UPDATE
-      // if the same constrained value appears twice in one INSERT statement.
-      const deduped: any[] = Array.from(
-        rows.reduce((map: Map<string, any>, row: any) => map.set(row.pin, row), new Map<string, any>()).values()
-      )
-
-      // Batch upsert non-geometry columns
-      for (let i = 0; i < deduped.length; i += INSERT_BATCH) {
-        const slice = deduped.slice(i, i + INSERT_BATCH)
-        try {
-          await db.insert(table).values(slice).onConflictDoUpdate({
-            target: table.pin,
-            set: {
-              address:          sql`excluded.address`,
-              ownerName:        sql`excluded.owner_name`,
-              ownerAddress:     sql`excluded.owner_address`,
-              legalDescription: sql`excluded.legal_description`,
-              landUseCode:      sql`excluded.land_use_code`,
-              zoningCode:       sql`excluded.zoning_code`,
-              assessedValue:    sql`excluded.assessed_value`,
-              landValue:        sql`excluded.land_value`,
-              buildingValue:    sql`excluded.building_value`,
-              lotAreaSqft:      sql`excluded.lot_area_sqft`,
-              buildingSqft:     sql`excluded.building_sqft`,
-              yearBuilt:        sql`excluded.year_built`,
-              ownershipType:    sql`excluded.ownership_type`,
-              rawAttributes:    sql`excluded.raw_attributes`,
-              dataHash:         sql`excluded.data_hash`,
-              lastUpdatedAt:    sql`excluded.last_updated_at`,
-            },
-          })
-          processed += slice.length
-        } catch (err) {
-          console.error(`[ingest:${countyId}] batch failed:`, err)
-          failed += slice.length
-        }
-      }
-
-      // Geometry second pass — deduplicated geomMap already has one entry per PIN
-      await updateGeometriesForBatch(countyId, geomMap)
+      if (norm.geometryGeoJson) geomMap.set(norm.pin, norm.geometryGeoJson)
     }
+
+    // Deduplicate by PIN — Postgres rejects ON CONFLICT DO UPDATE
+    // if the same constrained value appears twice in one INSERT statement.
+    const deduped: any[] = Array.from(
+      rows.reduce((map: Map<string, any>, row: any) => map.set(row.pin, row), new Map<string, any>()).values()
+    )
+
+    // Batch upsert non-geometry columns
+    for (let i = 0; i < deduped.length; i += INSERT_BATCH) {
+      const slice = deduped.slice(i, i + INSERT_BATCH)
+      try {
+        await db.insert(table).values(slice).onConflictDoUpdate({
+          target: table.pin,
+          set: {
+            address:          sql`excluded.address`,
+            ownerName:        sql`excluded.owner_name`,
+            ownerAddress:     sql`excluded.owner_address`,
+            legalDescription: sql`excluded.legal_description`,
+            landUseCode:      sql`excluded.land_use_code`,
+            zoningCode:       sql`excluded.zoning_code`,
+            assessedValue:    sql`excluded.assessed_value`,
+            landValue:        sql`excluded.land_value`,
+            buildingValue:    sql`excluded.building_value`,
+            lotAreaSqft:      sql`excluded.lot_area_sqft`,
+            buildingSqft:     sql`excluded.building_sqft`,
+            yearBuilt:        sql`excluded.year_built`,
+            ownershipType:    sql`excluded.ownership_type`,
+            rawAttributes:    sql`excluded.raw_attributes`,
+            dataHash:         sql`excluded.data_hash`,
+            lastUpdatedAt:    sql`excluded.last_updated_at`,
+          },
+        })
+        processed += slice.length
+      } catch (err) {
+        console.error(`[ingest:${countyId}] batch failed:`, err)
+        failed += slice.length
+      }
+    }
+
+    // Geometry second pass
+    await updateGeometriesForBatch(countyId, geomMap)
 
     await completeJob(job.id, processed, failed)
     console.log(`[ingest:${countyId}] Done. processed=${processed} failed=${failed}`)
@@ -232,9 +245,12 @@ async function ingestOverlayLayer(
 ) {
   console.log(`[pipeline] Ingesting overlay ${layerType} for ${countyId}`)
   const job = await createJob(countyId, `${layerType}:${layer.serviceUrl}`, 'full')
-  let processed = 0
 
   try {
+    // Collect all features first
+    type OverlayRow = { featureId: string | null; geojson: string; attrs: string }
+    const rows: OverlayRow[] = []
+
     for await (const batch of paginateLayer(layer.serviceUrl)) {
       for (const feature of batch) {
         const geojson = feature.geometry
@@ -246,38 +262,33 @@ async function ingestOverlayLayer(
                 : null,
             )
           : null
-
         if (!geojson || geojson === 'null') continue
 
-        const featureId = String(feature.attributes['OBJECTID'] ?? feature.attributes['FID'] ?? '')
-
-        try {
-          await db.execute(sql`
-            INSERT INTO spatial_features (id, county_id, layer_id, layer_type, feature_id, geometry, attributes, ingested_at)
-            VALUES (
-              gen_random_uuid(),
-              ${countyId},
-              ${layer.id},
-              ${layerType},
-              ${featureId || null},
-              ST_GeomFromGeoJSON(${geojson}),
-              ${JSON.stringify(feature.attributes)},
-              NOW()
-            )
-            ON CONFLICT (layer_id, feature_id) DO UPDATE SET
-              geometry   = ST_GeomFromGeoJSON(${geojson}),
-              attributes = ${JSON.stringify(feature.attributes)},
-              ingested_at = NOW()
-          `)
-          processed++
-        } catch (err) {
-          console.warn(`[overlay:${layerType}] feature insert failed:`, err)
-        }
+        const featureId = String(feature.attributes['OBJECTID'] ?? feature.attributes['FID'] ?? '') || null
+        rows.push({ featureId, geojson, attrs: JSON.stringify(feature.attributes) })
       }
     }
 
-    await completeJob(job.id, processed, 0)
-    console.log(`[overlay:${layerType}] Done. processed=${processed}`)
+    // Delete stale features for this layer, then batch insert fresh ones
+    await db.execute(sql`DELETE FROM spatial_features WHERE layer_id = ${layer.id}`)
+
+    for (let i = 0; i < rows.length; i += INSERT_BATCH) {
+      const slice = rows.slice(i, i + INSERT_BATCH)
+      const valueParts = slice.map(r =>
+        sql`(gen_random_uuid(), ${countyId}, ${layer.id}, ${layerType}, ${r.featureId}, ST_GeomFromGeoJSON(${r.geojson}), ${r.attrs}::jsonb, NOW())`
+      )
+      try {
+        await db.execute(sql`
+          INSERT INTO spatial_features (id, county_id, layer_id, layer_type, feature_id, geometry, attributes, ingested_at)
+          VALUES ${sql.join(valueParts, sql`, `)}
+        `)
+      } catch (err) {
+        console.warn(`[overlay:${layerType}] batch insert failed (${slice.length} rows):`, err)
+      }
+    }
+
+    await completeJob(job.id, rows.length, 0)
+    console.log(`[overlay:${layerType}] Done. processed=${rows.length}`)
   } catch (err) {
     await failJob(job.id, err)
     throw err
@@ -378,7 +389,7 @@ export async function runIngestion(opts: RunIngestionOptions): Promise<{ jobIds:
       try {
         await ingestParcelLayerWithGeometry(
           countyId,
-          { id: layer.id, serviceUrl: layer.serviceUrl, fieldMapping: layer.fieldMapping },
+          { id: layer.id, serviceUrl: layer.serviceUrl, fieldMapping: layer.fieldMapping, recordCount: layer.recordCount },
           opts.jobType,
         )
       } catch (err) {
@@ -394,13 +405,13 @@ export async function runIngestion(opts: RunIngestionOptions): Promise<{ jobIds:
       ),
     )
 
-    for (const layer of muniLayers) {
-      try {
-        await ingestOverlayLayer(countyId, layer, 'municipality')
-      } catch (err) {
-        console.error(`[pipeline] Municipality layer failed (${layer.serviceUrl}):`, err)
-      }
-    }
+    await Promise.allSettled(
+      muniLayers.map(layer =>
+        ingestOverlayLayer(countyId, layer, 'municipality').catch(err =>
+          console.error(`[pipeline] Municipality layer failed (${layer.serviceUrl}):`, err)
+        )
+      )
+    )
 
     // ── Step 3.5: Repair invalid geometries before any spatial join ──────────
     await repairSpatialGeometries(countyId)
@@ -408,46 +419,40 @@ export async function runIngestion(opts: RunIngestionOptions): Promise<{ jobIds:
     // ── Step 4: Spatial join after municipality boundaries are loaded ─────────
     await runMunicipalityJoin(countyId)
 
-    // ── Step 5b: Ingest flood zone overlay ───────────────────────────────────
-    const floodLayers = await db.select().from(dataLayers).where(
-      and(
-        eq(dataLayers.countyId, countyId),
-        eq(dataLayers.layerType, 'flood'),
-      ),
-    )
+    // ── Steps 5b–7b: Flood and zoning overlays are independent — run in parallel
+    const [floodLayers, zoningLayers] = await Promise.all([
+      db.select().from(dataLayers).where(and(eq(dataLayers.countyId, countyId), eq(dataLayers.layerType, 'flood'))),
+      db.select().from(dataLayers).where(and(eq(dataLayers.countyId, countyId), eq(dataLayers.layerType, 'zoning'))),
+    ])
 
-    for (const layer of floodLayers) {
-      try {
-        await ingestOverlayLayer(countyId, layer, 'flood')
-      } catch (err) {
-        console.error(`[pipeline] Flood layer failed (${layer.serviceUrl}):`, err)
-      }
-    }
+    await Promise.all([
+      // Flood: ingest all flood layers in parallel → stamp flood_zone
+      (async () => {
+        await Promise.allSettled(
+          floodLayers.map(layer =>
+            ingestOverlayLayer(countyId, layer, 'flood').catch(err =>
+              console.error(`[pipeline] Flood layer failed (${layer.serviceUrl}):`, err)
+            )
+          )
+        )
+        if (floodLayers.length > 0) await runFloodZoneUpdate(countyId)
+      })(),
 
-    // ── Step 6: Flood zone derived update ────────────────────────────────────
-    await runFloodZoneUpdate(countyId)
-
-    // ── Step 7a: Ingest zoning polygon overlay ────────────────────────────────
-    const zoningLayers = await db.select().from(dataLayers).where(
-      and(
-        eq(dataLayers.countyId, countyId),
-        eq(dataLayers.layerType, 'zoning'),
-      ),
-    )
-
-    for (const layer of zoningLayers) {
-      try {
-        await ingestOverlayLayer(countyId, layer, 'zoning')
-      } catch (err) {
-        console.error(`[pipeline] Zoning layer failed (${layer.serviceUrl}):`, err)
-      }
-    }
-
-    // ── Step 7b: Repair zoning geometries, then stamp zoning_code ───────────
-    if (zoningLayers.length > 0) {
-      await repairSpatialGeometries(countyId)
-      await runZoningCodeUpdate(countyId)
-    }
+      // Zoning: ingest all zoning layers in parallel → repair geometries → stamp zoning_code
+      (async () => {
+        await Promise.allSettled(
+          zoningLayers.map(layer =>
+            ingestOverlayLayer(countyId, layer, 'zoning').catch(err =>
+              console.error(`[pipeline] Zoning layer failed (${layer.serviceUrl}):`, err)
+            )
+          )
+        )
+        if (zoningLayers.length > 0) {
+          await repairSpatialGeometries(countyId)
+          await runZoningCodeUpdate(countyId)
+        }
+      })(),
+    ])
 
     console.log(`═══ Ingestion complete for ${countyId} ═══\n`)
   }

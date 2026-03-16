@@ -19,4 +19,7 @@ app.route('/ingest', ingest)
 app.route('/layers', layers)
 app.route('/search', search)
 
-export default app
+export default { 
+  port: 3004, 
+  fetch: app.fetch, 
+} 
