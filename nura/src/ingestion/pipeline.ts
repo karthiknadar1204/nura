@@ -184,6 +184,22 @@ async function ingestParcelLayerWithGeometry(
   }
 }
 
+// ── Step 3.5: Repair invalid geometries in spatial_features ──────────────────
+// Runs once after overlay ingestion. Fixes self-intersections etc. in-place so
+// that subsequent ST_Intersects calls don't need per-row ST_MakeValid wrappers
+// (which are too slow for Neon serverless timeouts).
+
+async function repairSpatialGeometries(countyId: string) {
+  console.log(`[pipeline] Repairing invalid geometries in spatial_features for ${countyId}`)
+  await db.execute(sql`
+    UPDATE spatial_features
+    SET geometry = ST_MakeValid(geometry)
+    WHERE county_id = ${countyId}
+      AND NOT ST_IsValid(geometry)
+  `)
+  console.log(`[pipeline] Geometry repair complete for ${countyId}`)
+}
+
 // ── Step 4: Spatial join — set municipality_id on parcels ─────────────────────
 // Joins parcels against the municipality boundaries in spatial_features.
 // Name match is case-insensitive to handle 'WHEATON' vs 'Wheaton'.
@@ -266,6 +282,31 @@ async function ingestOverlayLayer(
     await failJob(job.id, err)
     throw err
   }
+}
+
+// ── Step 7: Zoning code derived update ───────────────────────────────────────
+// After zoning polygons are in spatial_features, stamp zoning_code on parcels.
+// DuPage zoning layer uses the ZONING field (e.g. "R-1", "B-2", "I-1").
+
+async function runZoningCodeUpdate(countyId: string) {
+  console.log(`[pipeline] Running zoning code update for ${countyId}`)
+  const tableName = countyId === 'dupage' ? 'parcels_dupage' : 'parcels_cook'
+
+  await db.execute(sql`
+    UPDATE ${sql.raw(tableName)} p
+    SET zoning_code = COALESCE(
+      sf.attributes->>'ZONING',
+      sf.attributes->>'ZONE_CODE',
+      sf.attributes->>'ZONING_CLASS'
+    )
+    FROM spatial_features sf
+    WHERE sf.layer_type = 'zoning'
+      AND sf.county_id = ${countyId}
+      AND ST_Intersects(p.geometry, sf.geometry)
+      AND p.zoning_code IS NULL
+      AND p.geometry IS NOT NULL
+  `)
+  console.log(`[pipeline] Zoning code update complete for ${countyId}`)
 }
 
 // ── Step 6: Flood zone derived update ────────────────────────────────────────
@@ -361,6 +402,9 @@ export async function runIngestion(opts: RunIngestionOptions): Promise<{ jobIds:
       }
     }
 
+    // ── Step 3.5: Repair invalid geometries before any spatial join ──────────
+    await repairSpatialGeometries(countyId)
+
     // ── Step 4: Spatial join after municipality boundaries are loaded ─────────
     await runMunicipalityJoin(countyId)
 
@@ -382,6 +426,28 @@ export async function runIngestion(opts: RunIngestionOptions): Promise<{ jobIds:
 
     // ── Step 6: Flood zone derived update ────────────────────────────────────
     await runFloodZoneUpdate(countyId)
+
+    // ── Step 7a: Ingest zoning polygon overlay ────────────────────────────────
+    const zoningLayers = await db.select().from(dataLayers).where(
+      and(
+        eq(dataLayers.countyId, countyId),
+        eq(dataLayers.layerType, 'zoning'),
+      ),
+    )
+
+    for (const layer of zoningLayers) {
+      try {
+        await ingestOverlayLayer(countyId, layer, 'zoning')
+      } catch (err) {
+        console.error(`[pipeline] Zoning layer failed (${layer.serviceUrl}):`, err)
+      }
+    }
+
+    // ── Step 7b: Repair zoning geometries, then stamp zoning_code ───────────
+    if (zoningLayers.length > 0) {
+      await repairSpatialGeometries(countyId)
+      await runZoningCodeUpdate(countyId)
+    }
 
     console.log(`═══ Ingestion complete for ${countyId} ═══\n`)
   }

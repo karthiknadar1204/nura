@@ -1,95 +1,189 @@
-// Tool definitions for OpenAI function calling format.
+// OpenAI function-calling format tool definitions.
+// Derived from src/tools/definitions.ts (Anthropic input_schema → OpenAI parameters).
 
 export const toolDefinitions = [
   {
     type: 'function' as const,
     function: {
-      name: 'lookup_parcel',
-      description: 'Search for parcels by address, owner name, or PIN using fuzzy matching. Use when the user mentions a specific address, owner name, or parcel ID.',
+      name: 'search_parcels',
+      description:
+        'Search DuPage County parcel records by address, owner name, municipality, or flood zone. ' +
+        'Returns PIN, address, owner, municipality, and flood zone for each matching parcel.',
       parameters: {
         type: 'object',
         properties: {
-          query:  { type: 'string', description: 'Address, owner name, or PIN to search for' },
-          county: { type: 'string', enum: ['dupage', 'cook'], description: 'County to search in (default: dupage)' },
-          limit:  { type: 'number', description: 'Max results (default 5)' },
+          address:      { type: 'string', description: 'Partial address to search (e.g. "Goldenrod Dr")' },
+          owner:        { type: 'string', description: 'Partial owner name (e.g. "Forest Preserve")' },
+          municipality: { type: 'string', description: 'Municipality ID: naperville | wheaton | elmhurst | downers_grove | lombard | glen_ellyn | villa_park | carol_stream | warrenville | westmont' },
+          flood_zone:   { type: 'string', description: 'FEMA flood zone code: A | AE | FW | X' },
+          limit:        { type: 'number', description: 'Max results to return (default 20)' },
+        },
+      },
+    },
+  },
+
+  {
+    type: 'function' as const,
+    function: {
+      name: 'get_flood_zone_summary',
+      description:
+        'Summarise how many parcels fall in each flood zone across DuPage County, ' +
+        'optionally filtered to a single municipality.',
+      parameters: {
+        type: 'object',
+        properties: {
+          municipality: { type: 'string', description: 'Optional municipality ID to narrow the summary' },
+        },
+      },
+    },
+  },
+
+  {
+    type: 'function' as const,
+    function: {
+      name: 'list_zoning_districts',
+      description:
+        "List all zoning districts defined in a municipality's zoning ordinance. " +
+        'Returns district code, full name, and category (residential/commercial/industrial/mixed/overlay).',
+      parameters: {
+        type: 'object',
+        properties: {
+          municipality: { type: 'string', description: 'Municipality ID: naperville | evanston' },
+        },
+        required: ['municipality'],
+      },
+    },
+  },
+
+  {
+    type: 'function' as const,
+    function: {
+      name: 'get_permitted_uses',
+      description:
+        'Return uses permitted in a specific zoning district — by right, conditional, prohibited, or accessory. ' +
+        'Use this to answer "what can I build/operate in zone X?" questions.',
+      parameters: {
+        type: 'object',
+        properties: {
+          municipality:  { type: 'string', description: 'Municipality ID: naperville | evanston' },
+          district_code: { type: 'string', description: 'Zoning district code, e.g. R1A, B1, RD' },
+          permit_type: {
+            type: 'string',
+            enum: ['by_right', 'conditional', 'prohibited', 'accessory'],
+            description: 'Filter by permit type (omit to return all)',
+          },
+        },
+        required: ['municipality', 'district_code'],
+      },
+    },
+  },
+
+  {
+    type: 'function' as const,
+    function: {
+      name: 'get_development_standards',
+      description:
+        'Return dimensional/development standards for a zoning district: minimum lot size, ' +
+        'setbacks, max height, max lot coverage, floor area ratio, density, etc.',
+      parameters: {
+        type: 'object',
+        properties: {
+          municipality:  { type: 'string', description: 'Municipality ID: naperville | evanston' },
+          district_code: { type: 'string', description: 'Zoning district code, e.g. R1A, B1, RD' },
+        },
+        required: ['municipality', 'district_code'],
+      },
+    },
+  },
+
+  {
+    type: 'function' as const,
+    function: {
+      name: 'compare_districts',
+      description:
+        'Side-by-side comparison of development standards between two zoning districts. ' +
+        'Districts may be in the same or different municipalities.',
+      parameters: {
+        type: 'object',
+        properties: {
+          municipality_a:  { type: 'string', description: 'Municipality ID for district A' },
+          district_code_a: { type: 'string', description: 'District code for district A' },
+          municipality_b:  { type: 'string', description: 'Municipality ID for district B' },
+          district_code_b: { type: 'string', description: 'District code for district B' },
+        },
+        required: ['municipality_a', 'district_code_a', 'municipality_b', 'district_code_b'],
+      },
+    },
+  },
+
+  {
+    type: 'function' as const,
+    function: {
+      name: 'search_ordinance_text',
+      description:
+        'Semantic search across ingested zoning ordinance text for Naperville and Evanston. ' +
+        'Use this to answer nuanced questions not covered by structured tables — e.g. home occupation rules, ' +
+        'sign regulations, parking ratios, ADU requirements, cannabis use rules, PUDs, nonconforming uses.',
+      parameters: {
+        type: 'object',
+        properties: {
+          query:        { type: 'string', description: 'Keyword or phrase to search for' },
+          municipality: { type: 'string', description: 'Optional: naperville | evanston — omit to search both' },
+          limit:        { type: 'number', description: 'Max chunks to return (default 5)' },
         },
         required: ['query'],
       },
     },
   },
+
   {
     type: 'function' as const,
     function: {
-      name: 'filter_parcels',
-      description: 'Filter parcels by structured criteria: municipality, flood zone, owner type, zoning code, assessed value range, or year built. Use for broad queries like "all flood zone parcels in Addison" or "corporate-owned properties worth over $500k".',
+      name: 'get_parcels_in_flood_zone',
+      description:
+        'Return parcels in a specific FEMA flood zone (A, AE, FW, X), optionally filtered by municipality.',
       parameters: {
         type: 'object',
         properties: {
-          county:         { type: 'string', enum: ['dupage', 'cook'] },
-          municipality:   { type: 'string', description: 'Municipality name e.g. "Addison", "Downers Grove"' },
-          flood_zone:     { type: 'string', description: 'Specific FEMA flood zone code e.g. "AE", "X", "FW"' },
-          in_flood_zone:  { type: 'boolean', description: 'true = only parcels in any flood zone, false = only parcels not in flood zone' },
-          owner_type:     { type: 'string', enum: ['individual', 'corporate', 'trust', 'government'] },
-          zoning_code:    { type: 'string', description: 'Zoning code e.g. "R-1", "B-3"' },
-          min_value:      { type: 'number', description: 'Minimum assessed value in dollars' },
-          max_value:      { type: 'number', description: 'Maximum assessed value in dollars' },
-          min_year_built: { type: 'number', description: 'Minimum year built' },
-          max_year_built: { type: 'number', description: 'Maximum year built' },
-          limit:          { type: 'number', description: 'Max results (default 10, max 50)' },
+          flood_zone:   { type: 'string', description: 'FEMA flood zone code: A | AE | FW | X' },
+          municipality: { type: 'string', description: 'Optional municipality ID to narrow results' },
+          limit:        { type: 'number', description: 'Max results (default 20)' },
         },
-        required: [],
+        required: ['flood_zone'],
       },
     },
   },
+
   {
     type: 'function' as const,
     function: {
-      name: 'get_parcel_detail',
-      description: 'Get full details for a specific parcel by exact PIN number.',
+      name: 'list_available_layers',
+      description:
+        'List all GIS data layers discovered and registered from DuPage County ArcGIS. ' +
+        'Shows layer name, type (parcel/flood/road/school/wetland/zoning), and record count.',
       parameters: {
         type: 'object',
         properties: {
-          pin:    { type: 'string', description: 'Parcel identification number' },
-          county: { type: 'string', enum: ['dupage', 'cook'] },
+          county:     { type: 'string', description: 'County ID: dupage | cook' },
+          layer_type: { type: 'string', description: 'Filter by type: parcel | flood | road | school | wetland | zoning | municipality | misc' },
         },
-        required: ['pin'],
       },
     },
   },
+
   {
     type: 'function' as const,
     function: {
-      name: 'spatial_query',
-      description: 'Find parcels within a radius of a point. The center can be given as lat/lng coordinates OR as an address/PIN string. Optionally filter results by flood zone, owner type, etc.',
+      name: 'get_municipality_summary',
+      description:
+        'High-level overview for a municipality: county, parcel count, zoning district count, ' +
+        'ordinance chunk count, zoning source, and last scrape time.',
       parameters: {
         type: 'object',
         properties: {
-          address_pin:    { type: 'string', description: 'Address or PIN to use as the center point (alternative to lat/lng)' },
-          lat:            { type: 'number', description: 'Latitude of center point' },
-          lng:            { type: 'number', description: 'Longitude of center point' },
-          radius_meters:  { type: 'number', description: 'Search radius in meters (default 500)' },
-          county:         { type: 'string', enum: ['dupage', 'cook'] },
-          flood_zone:     { type: 'string', description: 'Filter by specific flood zone code' },
-          in_flood_zone:  { type: 'boolean', description: 'true = only flood zone parcels, false = only non-flood zone' },
-          owner_type:     { type: 'string', enum: ['individual', 'corporate', 'trust', 'government'] },
-          limit:          { type: 'number', description: 'Max results (default 10)' },
+          municipality: { type: 'string', description: 'Municipality ID: naperville | evanston | wheaton | elmhurst | downers_grove' },
         },
-        required: [],
-      },
-    },
-  },
-  {
-    type: 'function' as const,
-    function: {
-      name: 'get_county_stats',
-      description: 'Get aggregate statistics for a county or municipality: total parcels, flood zone breakdown, ownership type breakdown, average assessed values.',
-      parameters: {
-        type: 'object',
-        properties: {
-          county:       { type: 'string', enum: ['dupage', 'cook'] },
-          municipality: { type: 'string', description: 'Optionally narrow stats to a specific municipality' },
-        },
-        required: [],
+        required: ['municipality'],
       },
     },
   },
